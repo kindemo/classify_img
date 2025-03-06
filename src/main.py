@@ -1,205 +1,227 @@
+import os
+import numpy as np
+import SimpleITK as sitk
+import pandas as pd
 import tensorflow as tf
-
-import tensorflow_datasets as tfds
-from keras import Sequential
-from keras.layers import Dropout
-from tensorflow.keras.layers import Conv2DTranspose, BatchNormalization, ReLU
-
-
-from IPython.display import clear_output
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
+from skimage.draw import ellipsoid
 
-dataset, info = tfds.load('oxford_iiit_pet:3.*.*', with_info=True)
-
-def normalize(input_image, input_mask):
-  input_image = tf.cast(input_image, tf.float32) / 255.0
-  input_mask -= 1
-  return input_image, input_mask
-
-def load_image(datapoint):
-  input_image = tf.image.resize(datapoint['image'], (128, 128))
-  input_mask = tf.image.resize(
-    datapoint['segmentation_mask'],
-    (128, 128),
-    method = tf.image.ResizeMethod.NEAREST_NEIGHBOR,
-  )
-
-  input_image, input_mask = normalize(input_image, input_mask)
-
-  return input_image, input_mask
+# 配置文件路径
+DATA_DIR = 'D:/BaiduNetdiskDownload/LUNA16/subset0'
+ANNOTATION_FILE = 'D:/BaiduNetdiskDownload/LUNA16/CSVFILES/annotations.csv'
+TARGET_SIZE = (256, 256)
 
 
-TRAIN_LENGTH = info.splits['train'].num_examples
-BATCH_SIZE = 64
-BUFFER_SIZE = 1000
-STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE
+def load_scan(mhd_path):
+    """加载并预处理单个CT扫描"""
+    image = sitk.ReadImage(mhd_path)
+    array = sitk.GetArrayFromImage(image)  # (depth, height, width)
 
-train_images = dataset['train'].map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
-test_images = dataset['test'].map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+    # 预处理
+    processed = []
+    for slice in array:
+        slice = (slice + 1000) / 1400  # CT值归一化
+        slice = np.clip(slice, 0, 1)
+        slice = np.expand_dims(slice, axis=-1)  # (h, w, 1)
+        slice = tf.image.resize(slice, TARGET_SIZE).numpy()
+        processed.append(slice)
 
-class Augment(tf.keras.layers.Layer):
-  def __init__(self, seed=42):
-    super().__init__()
-    # both use the same seed, so they'll make the same random changes.
-    self.augment_inputs = tf.keras.layers.RandomFlip(mode="horizontal", seed=seed)
-    self.augment_labels = tf.keras.layers.RandomFlip(mode="horizontal", seed=seed)
+    return np.array(processed)  # (depth, 256, 256, 1)
 
-  def call(self, inputs, labels):
-    inputs = self.augment_inputs(inputs)
-    labels = self.augment_labels(labels)
-    return inputs, labels
 
-train_batches = (
-  train_images
-  .cache()
-  .shuffle(BUFFER_SIZE)
-  .batch(BATCH_SIZE)
-  .repeat()
-  .map(Augment())
-  .prefetch(buffer_size=tf.data.AUTOTUNE))
+def create_mask(mhd_path, df_annot):
+    image = sitk.ReadImage(mhd_path)
+    array = sitk.GetArrayFromImage(image)  # (z,y,x)
+    mask = np.zeros_like(array, dtype=np.float32)
 
-test_batches = test_images.batch(BATCH_SIZE)
+    seriesuid = os.path.basename(mhd_path).split('.mhd')[0]
+    nodules = df_annot[df_annot['seriesuid'] == seriesuid]
 
-def display(display_list):
-  plt.figure(figsize=(15, 15))
+    for _, row in nodules.iterrows():
+        try:
+            world_coord = [row['coordX'], row['coordY'], row['coordZ']]
+            voxel_coord = image.TransformPhysicalPointToIndex(world_coord)
+            x, y, z = voxel_coord  # SimpleITK顺序(x,y,z)
 
-  title = ['Input Image', 'True Mask', 'Predicted Mask']
+            # 转换为numpy数组的(z,y,x)顺序
+            z_dim = z
+            y_dim = y
+            x_dim = x
 
-  for i in range(len(display_list)):
-    plt.subplot(1, len(display_list), i+1)
-    plt.title(title[i])
-    plt.imshow(tf.keras.utils.array_to_img(display_list[i]))
+            spacing = image.GetSpacing()
+            diameter = row['diameter_mm']
+
+            # 计算半径（体素单位）
+            radius_x = (diameter / spacing[0]) / 2
+            radius_y = (diameter / spacing[1]) / 2
+            radius_z = (diameter / spacing[2]) / 2
+
+            # 强制最小半径（关键！）
+            radius_x = max(2, int(round(radius_x)))  # 至少2像素
+            radius_y = max(2, int(round(radius_y)))
+            radius_z = max(1, int(round(radius_z)))  # z轴可接受1层
+
+            # 计算椭球范围
+            z_min = max(0, z_dim - radius_z)
+            z_max = min(array.shape[0], z_dim + radius_z + 1)
+            y_min = max(0, y_dim - radius_y)
+            y_max = min(array.shape[1], y_dim + radius_y + 1)
+            x_min = max(0, x_dim - radius_x)
+            x_max = min(array.shape[2], x_dim + radius_x + 1)
+
+            # 生成椭球
+            zz, yy, xx = np.ogrid[z_min:z_max, y_min:y_max, x_min:x_max]
+            distances = (
+                    ((xx - x_dim) / radius_x) ** 2 +
+                    ((yy - y_dim) / radius_y) ** 2 +
+                    ((zz - z_dim) / radius_z) ** 2
+            )
+            mask_roi = (distances <= 1.0).astype(np.float32)
+
+            # 写入mask
+            mask[z_min:z_max, y_min:y_max, x_min:x_max] = np.maximum(
+                mask[z_min:z_max, y_min:y_max, x_min:x_max],
+                mask_roi
+            )
+
+        except Exception as e:
+            print(f"处理结节时出错: {e}")
+            continue
+
+    # 调整尺寸
+    resized_mask = [
+        tf.image.resize(np.expand_dims(s, -1), TARGET_SIZE, method='nearest').numpy()
+        for s in mask
+    ]
+    return np.array(resized_mask)
+
+def load_dataset():
+    """加载完整数据集"""
+    mhd_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.mhd')]
+
+    # 正确读取CSV，假设原文件有标题行
+    df_annot = pd.read_csv(ANNOTATION_FILE,
+                           dtype={
+                               'seriesuid': str,
+                               'coordX': np.float64,
+                               'coordY': np.float64,
+                               'coordZ': np.float64,
+                               'diameter_mm': np.float64
+                           })
+
+    scans, masks = [], []
+    for mhd_file in mhd_files[:3]:  # 测试前3个文件
+        mhd_path = os.path.join(DATA_DIR, mhd_file)
+        scan = load_scan(mhd_path)
+        mask = create_mask(mhd_path, df_annot)
+
+        scans.extend(scan)
+        masks.extend(mask)
+
+    return np.array(scans), np.array(masks)
+
+
+def build_unet(input_shape=(256, 256, 1)):
+    inputs = Input(input_shape)
+
+    # 编码器 (3次下采样)
+    # Block 1 (256x256)
+    c1 = Conv2D(64, 3, activation='relu', padding='same')(inputs)
+    c1 = Conv2D(64, 3, activation='relu', padding='same')(c1)
+    p1 = MaxPooling2D((2, 2))(c1)  # 128x128
+
+    # Block 2 (128x128)
+    c2 = Conv2D(128, 3, activation='relu', padding='same')(p1)
+    c2 = Conv2D(128, 3, activation='relu', padding='same')(c2)
+    p2 = MaxPooling2D((2, 2))(c2)  # 64x64
+
+    # Block 3 (64x64)
+    c3 = Conv2D(256, 3, activation='relu', padding='same')(p2)
+    c3 = Conv2D(256, 3, activation='relu', padding='same')(c3)
+    p3 = MaxPooling2D((2, 2))(c3)  # 32x32
+
+    # 瓶颈层 (32x32)
+    b = Conv2D(512, 3, activation='relu', padding='same')(p3)
+    b = Conv2D(512, 3, activation='relu', padding='same')(b)
+
+    # 解码器 (3次上采样)
+    # Up Block 1 (32x32 -> 64x64)
+    u1 = UpSampling2D((2, 2))(b)
+    u1 = Concatenate()([u1, c3])
+    u1 = Conv2D(256, 3, activation='relu', padding='same')(u1)
+    u1 = Conv2D(256, 3, activation='relu', padding='same')(u1)
+
+    # Up Block 2 (64x64 -> 128x128)
+    u2 = UpSampling2D((2, 2))(u1)
+    u2 = Concatenate()([u2, c2])
+    u2 = Conv2D(128, 3, activation='relu', padding='same')(u2)
+    u2 = Conv2D(128, 3, activation='relu', padding='same')(u2)
+
+    # Up Block 3 (128x128 -> 256x256)
+    u3 = UpSampling2D((2, 2))(u2)
+    u3 = Concatenate()([u3, c1])
+    u3 = Conv2D(64, 3, activation='relu', padding='same')(u3)
+    u3 = Conv2D(64, 3, activation='relu', padding='same')(u3)
+
+    outputs = Conv2D(1, 1, activation='sigmoid')(u3)
+
+    model = Model(inputs, outputs)
+    model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy')
+    return model
+
+
+
+# 主程序
+if __name__ == "__main__":
+    # 加载数据
+    scans, masks = load_dataset()
+    print(f"数据维度: {scans.shape}, Mask维度: {masks.shape}")
+    print("Mask中非零像素数量:", np.sum(masks != 0))
+    print("Mask像素值分布:", np.unique(masks, return_counts=True))
+
+    # 随机可视化5个真实mask
+    for i in np.random.randint(0, len(masks), 5):
+        plt.imshow(masks[i, ..., 0], cmap='gray')
+        plt.title(f'Mask {i}')
+        plt.show()
+
+    # 构建模型
+    model = build_unet()
+    model.summary()
+
+    # 训练
+    history = model.fit(scans, masks,
+                        batch_size=8,
+                        epochs=1,
+                        validation_split=0.2)
+
+    # 可视化结果
+    test_idx = 100
+    pred = model.predict(scans[test_idx][np.newaxis, ...])
+
+    # 修改后的可视化部分
+    plt.figure(figsize=(12, 6))
+
+    # 显示输入图像
+    plt.subplot(1, 3, 1)
+    plt.imshow(scans[test_idx, ..., 0], cmap='gray')
+    plt.title('Input')
     plt.axis('off')
-  plt.show()
 
-for images, masks in train_batches.take(2):
-  sample_image, sample_mask = images[0], masks[0]
-  display([sample_image, sample_mask])
+    # 显示真实mask
+    plt.subplot(1, 3, 2)
+    plt.imshow(masks[test_idx, ..., 0], cmap='gray')
+    plt.title('Ground Truth')
+    plt.axis('off')
 
+    # 显示预测结果
+    plt.subplot(1, 3, 3)
+    plt.imshow(pred[0, ..., 0], cmap='gray')
+    plt.title('Prediction')
+    plt.axis('off')
 
-base_model = tf.keras.applications.MobileNetV2(input_shape=[128, 128, 3], include_top=False)
-
-# Use the activations of these layers
-layer_names = [
-    'block_1_expand_relu',   # 64x64
-    'block_3_expand_relu',   # 32x32
-    'block_6_expand_relu',   # 16x16
-    'block_13_expand_relu',  # 8x8
-    'block_16_project',      # 4x4
-]
-base_model_outputs = [base_model.get_layer(name).output for name in layer_names]
-
-# Create the feature extraction model
-down_stack = tf.keras.Model(inputs=base_model.input, outputs=base_model_outputs)
-
-down_stack.trainable = False
-
-
-
-# 上采样
-def upsample(filters, size, apply_dropout=False):
-    initializer = tf.random_normal_initializer(0., 0.02)
-
-    result = Sequential()
-    result.add(
-        Conv2DTranspose(
-            filters,
-            size,
-            strides=2,          # 关键：步长 2 实现上采样
-            padding='same',
-            kernel_initializer=initializer,
-            use_bias=False
-        )
-    )
-    result.add(BatchNormalization())
-    if apply_dropout:
-        result.add(Dropout(0.5))  # 可选：是否添加 Dropout
-    result.add(ReLU())
-
-    return result
-
-up_stack = [
-    upsample(512, 3),  # 4x4 -> 8x8
-    upsample(256, 3),  # 8x8 -> 16x16
-    upsample(128, 3),  # 16x16 -> 32x32
-    upsample(64, 3),   # 32x32 -> 64x64
-]
-
-def unet_model(output_channels:int):
-  inputs = tf.keras.layers.Input(shape=[128, 128, 3])
-
-  # Downsampling through the model
-  skips = down_stack(inputs)
-  x = skips[-1]
-  skips = reversed(skips[:-1])
-
-  # Upsampling and establishing the skip connections
-  for up, skip in zip(up_stack, skips):
-    x = up(x)
-    concat = tf.keras.layers.Concatenate()
-    x = concat([x, skip])
-
-  # This is the last layer of the model
-  last = tf.keras.layers.Conv2DTranspose(
-      filters=output_channels, kernel_size=3, strides=2,
-      padding='same')  #64x64 -> 128x128
-
-  x = last(x)
-
-  return tf.keras.Model(inputs=inputs, outputs=x)
-
-OUTPUT_CLASSES = 3
-
-model = unet_model(output_channels=OUTPUT_CLASSES)
-model.compile(optimizer='adam',
-              loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-              metrics=['accuracy'])
-
-tf.keras.utils.plot_model(model, show_shapes=True)
-
-def create_mask(pred_mask):
-  pred_mask = tf.math.argmax(pred_mask, axis=-1)
-  pred_mask = pred_mask[..., tf.newaxis]
-  return pred_mask[0]
-
-def show_predictions(dataset=None, num=1):
-  if dataset:
-    for image, mask in dataset.take(num):
-      pred_mask = model.predict(image)
-      display([image[0], mask[0], create_mask(pred_mask)])
-  else:
-    display([sample_image, sample_mask,
-             create_mask(model.predict(sample_image[tf.newaxis, ...]))])
-
-show_predictions()
-
-class DisplayCallback(tf.keras.callbacks.Callback):
-  def on_epoch_end(self, epoch, logs=None):
-    clear_output(wait=True)
-    show_predictions()
-    print ('\nSample Prediction after epoch {}\n'.format(epoch+1))
-
-EPOCHS = 20
-VAL_SUBSPLITS = 5
-VALIDATION_STEPS = info.splits['test'].num_examples//BATCH_SIZE//VAL_SUBSPLITS
-
-model_history = model.fit(train_batches, epochs=EPOCHS,
-                          steps_per_epoch=STEPS_PER_EPOCH,
-                          validation_steps=VALIDATION_STEPS,
-                          validation_data=test_batches,
-                          callbacks=[DisplayCallback()])
-
-loss = model_history.history['loss']
-val_loss = model_history.history['val_loss']
-
-plt.figure()
-plt.plot(model_history.epoch, loss, 'r', label='Training loss')
-plt.plot(model_history.epoch, val_loss, 'bo', label='Validation loss')
-plt.title('Training and Validation Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss Value')
-plt.ylim([0, 1])
-plt.legend()
-plt.show()
-
-show_predictions(test_batches, 3)
+    plt.tight_layout()  # 自动调整子图间距
+    plt.show()
