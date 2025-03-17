@@ -5,19 +5,21 @@ import numpy as np
 import SimpleITK as sitk
 import pandas as pd
 import tensorflow as tf
+from keras.layers import GlobalAveragePooling2D, Dense
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Concatenate
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
-
+from tensorflow.keras.applications import EfficientNetB0
 from src.utils import AdaptiveCombinedLoss
+# import albumentations as A
 
 # 配置文件路径
-DATA_DIR = 'D:/BaiduNetdiskDownload/LUNA16/subset0'
+DATA_DIR = 'D:/BaiduNetdiskDownload/LUNA16/'
 ANNOTATION_FILE = 'D:/BaiduNetdiskDownload/LUNA16/CSVFILES/annotations.csv'
 TARGET_SIZE = (256, 256)
 # 创建独立的验证集目录
-VAL_DIR = 'D:/BaiduNetdiskDownload/LUNA16/validation_subset1'
+VAL_DIR = 'D:/BaiduNetdiskDownload/LUNA16/validation_subset9'
 
 
 # 全局加载标注数据
@@ -47,10 +49,17 @@ def configure_gpu():
         except RuntimeError as e:
             print(f"Error configuring GPU: {e}")
 
+
 def load_scan(mhd_path):
-    """加载并预处理CT扫描，返回数据和元数据"""
+    """
+        加载并预处理CT扫描，返回数据和元数据
+        输出(depth, 256, 256, 1)
+    """
     image = sitk.ReadImage(mhd_path)
-    array = sitk.GetArrayFromImage(image)  # (depth, height, width)
+    processed = []
+
+    HU_MIN = -1000.0
+    HU_MAX = 400.0
 
     # 获取元数据
     meta = {
@@ -59,22 +68,17 @@ def load_scan(mhd_path):
         'seriesuid': os.path.basename(mhd_path).split('.mhd')[0]
     }
 
-    # 预处理
-    processed = []
-    HU_MIN = -1000
-    HU_MAX = 400
-
-    array = np.clip(array, HU_MIN, HU_MAX)  # 先限制范围
-    array = (array - HU_MIN) / (HU_MAX - HU_MIN)  # 归一化到0-1
-
-    for slice in array:
-        # slice = (slice + 1000) / 1400  # CT值归一化
-        # slice = np.clip(slice, 0, 1)
-        slice = np.expand_dims(slice, axis=-1)  # (h, w, 1)
-        slice = tf.image.resize(slice, TARGET_SIZE).numpy()
-        processed.append(slice)
+    for z in range(image.GetDepth()):
+        # 逐层读取切片
+        array = sitk.GetArrayFromImage(image[:, :, z]).astype(np.float32)
+        array = np.clip(array, HU_MIN, HU_MAX)
+        array = (array - HU_MIN) / (HU_MAX - HU_MIN)
+        # 调整尺寸并保存
+        resized = tf.image.resize(np.expand_dims(array, -1), TARGET_SIZE).numpy()
+        processed.append(resized)
 
     return np.array(processed), meta  # (depth, 256, 256, 1)
+
 
 
 def create_mask(mhd_path):
@@ -157,155 +161,185 @@ def create_mask(mhd_path):
     return np.array(resized_mask)  # (depth, 256, 256, 1)
 
 
-def crop_roi(scan, mask, image_meta, roi_size=256):
-    """生成2D ROI训练样本"""
+def crop_roi(scan_data, mask_data, image_meta, roi_size=128, max_samples=1000):
+    """修正后的ROI截取函数（包含坐标验证和样本平衡）"""
     seriesuid = image_meta['seriesuid']
     candidates = CAND_DF[CAND_DF['seriesuid'] == seriesuid]
 
-    spacing = image_meta['spacing']
-    origin = image_meta['origin']
+    # 加载原始图像以获取方向信息
+    mhd_path = os.path.join(DATA_DIR, 'subset0', f'{seriesuid}.mhd')  # 根据实际路径调整
+    image = sitk.ReadImage(mhd_path)
 
-    rois = []
+    samples = []
+    true_positives = 0
+    false_positives = 0
+
     for _, row in candidates.iterrows():
+        # 物理坐标 -> 连续体素坐标（考虑方向矩阵）
         try:
-            # 物理坐标转换
-            coord_z = (row['coordZ'] - origin[2]) / spacing[2]
-            coord_y = (row['coordY'] - origin[1]) / spacing[1]
-            coord_x = (row['coordX'] - origin[0]) / spacing[0]
-
-            center_z = int(round(coord_z))
-            center_y = int(round(coord_y))
-            center_x = int(round(coord_x))
-
-            # 确保坐标有效性
-            if (center_z < 0 or center_z >= scan.shape[0] or
-                    center_y < 0 or center_y >= scan.shape[1] or
-                    center_x < 0 or center_x >= scan.shape[2]):
-                continue
-
-            # 计算2D边界
-            y_start = max(0, center_y - roi_size // 2)
-            y_end = min(scan.shape[1], center_y + roi_size // 2)
-            x_start = max(0, center_x - roi_size // 2)
-            x_end = min(scan.shape[2], center_x + roi_size // 2)
-
-            # 提取并调整尺寸
-            roi_scan = scan[center_z, y_start:y_end, x_start:x_end, :]
-            roi_mask = mask[center_z, y_start:y_end, x_start:x_end, :]
-
-            roi_scan = tf.image.resize(roi_scan, (roi_size, roi_size)).numpy()
-            roi_mask = tf.image.resize(roi_mask, (roi_size, roi_size)).numpy()
-
-            rois.append((roi_scan, roi_mask))
-
-        except Exception as e:
-            print(f"截取ROI出错: {str(e)}")
+            physical_point = (row['coordX'], row['coordY'], row['coordZ'])
+            continuous_index = image.TransformPhysicalPointToContinuousIndex(physical_point)
+        except:
             continue
 
-    return rois
+        # 转换坐标顺序：SimpleITK返回(x,y,z)，numpy数组是(z,y,x)
+        z = int(round(continuous_index[2]))  # 深度维度
+        y = int(round(continuous_index[1]))  # 高度
+        x = int(round(continuous_index[0]))  # 宽度
+
+        # 验证坐标有效性
+        if (z < 0 or z >= scan_data.shape[0] or
+                y < 0 or y >= scan_data.shape[1] or
+                x < 0 or x >= scan_data.shape[2]):
+            continue
+
+        # 确定是否为真实结节（3mm容差）
+        is_true = False
+        diameter = 3.0  # 候选框默认直径
+        for _, nodule in ANNOT_DF[ANNOT_DF['seriesuid'] == seriesuid].iterrows():
+            distance = np.sqrt(
+                (nodule['coordX'] - row['coordX']) ** 2 +
+                (nodule['coordY'] - row['coordY']) ** 2 +
+                (nodule['coordZ'] - row['coordZ']) ** 2
+            )
+            if distance < max(nodule['diameter_mm'], diameter):
+                is_true = True
+                diameter = nodule['diameter_mm']
+                break
+
+        # 平衡采样
+        if is_true:
+            if true_positives >= max_samples // 2:  # 控制正样本数量
+                continue
+            true_positives += 1
+        else:
+            if false_positives >= max_samples // 2:  # 控制负样本数量
+                continue
+            false_positives += 1
+
+        # 计算ROI边界（考虑不同尺寸候选框）
+        radius = int(round(diameter / (image_meta['spacing'][0] * 2)))  # 基于X方向间距
+        size = min(roi_size, radius * 2)
+
+        # 确保边界不越界
+        y_start = max(0, y - size // 2)
+        y_end = min(scan_data.shape[1], y + size // 2)
+        x_start = max(0, x - size // 2)
+        x_end = min(scan_data.shape[2], x + size // 2)
+
+        # 截取扫描和掩码区域
+        roi_scan = scan_data[z, y_start:y_end, x_start:x_end, :]
+        roi_mask = mask_data[z, y_start:y_end, x_start:x_end, :]
+
+        # 调整尺寸并标准化
+        roi_scan = tf.image.resize(roi_scan, (roi_size, roi_size)).numpy()
+        roi_mask = tf.image.resize(roi_mask, (roi_size, roi_size)).numpy()
+
+        # 增强负样本（添加随机偏移）
+        if not is_true and np.random.rand() > 0.5:
+            offset = np.random.randint(-5, 5, size=2)
+            roi_scan = np.roll(roi_scan, offset, axis=(0, 1))
+
+        samples.append((roi_scan, roi_mask, int(is_true)))
+
+    return samples
+
+def build_model():
+    base = EfficientNetB0(weights=None, include_top=False, input_shape=(256,256,1))
+    x = base.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(256, activation='relu')(x)
+    outputs = Dense(1, activation='sigmoid')(x)
+    return Model(inputs=base.input, outputs=outputs)
+
+# def build_unet(input_shape=(256, 256, 1)):
+#     """构建U-Net模型"""
+#     inputs = Input(input_shape)
+#
+#     # 编码器
+#     c1 = Conv2D(64, 3, activation='relu', padding='same')(inputs)
+#     c1 = Conv2D(64, 3, activation='relu', padding='same')(c1)
+#     p1 = MaxPooling2D((2, 2))(c1)
+#
+#     c2 = Conv2D(128, 3, activation='relu', padding='same')(p1)
+#     c2 = Conv2D(128, 3, activation='relu', padding='same')(c2)
+#     p2 = MaxPooling2D((2, 2))(c2)
+#
+#     c3 = Conv2D(256, 3, activation='relu', padding='same')(p2)
+#     c3 = Conv2D(256, 3, activation='relu', padding='same')(c3)
+#     p3 = MaxPooling2D((2, 2))(c3)
+#
+#     # 瓶颈层
+#     b = Conv2D(512, 3, activation='relu', padding='same')(p3)
+#     b = Conv2D(512, 3, activation='relu', padding='same')(b)
+#
+#     # 解码器
+#     u1 = UpSampling2D((2, 2))(b)
+#     u1 = Concatenate()([u1, c3])
+#     u1 = Conv2D(256, 3, activation='relu', padding='same')(u1)
+#     u1 = Conv2D(256, 3, activation='relu', padding='same')(u1)
+#
+#     u2 = UpSampling2D((2, 2))(u1)
+#     u2 = Concatenate()([u2, c2])
+#     u2 = Conv2D(128, 3, activation='relu', padding='same')(u2)
+#     u2 = Conv2D(128, 3, activation='relu', padding='same')(u2)
+#
+#     u3 = UpSampling2D((2, 2))(u2)
+#     u3 = Concatenate()([u3, c1])
+#     u3 = Conv2D(64, 3, activation='relu', padding='same')(u3)
+#     u3 = Conv2D(64, 3, activation='relu', padding='same')(u3)
+#
+#     outputs = Conv2D(1, 1, activation='sigmoid')(u3)
+#
+#     model = Model(inputs, outputs)
+#     return model
 
 
-def build_unet(input_shape=(256, 256, 1)):
-    """构建U-Net模型"""
-    inputs = Input(input_shape)
+def generate_slice_samples(data_dir):
+    subset_dirs = [d for d in os.listdir(data_dir) if d.startswith("subset")]
 
-    # 编码器
-    c1 = Conv2D(64, 3, activation='relu', padding='same')(inputs)
-    c1 = Conv2D(64, 3, activation='relu', padding='same')(c1)
-    p1 = MaxPooling2D((2, 2))(c1)
+    for subset_dir in subset_dirs:
+        subset_path = os.path.join(data_dir, subset_dir)
+        mhd_files = [f for f in os.listdir(subset_path) if f.endswith('.mhd')]
 
-    c2 = Conv2D(128, 3, activation='relu', padding='same')(p1)
-    c2 = Conv2D(128, 3, activation='relu', padding='same')(c2)
-    p2 = MaxPooling2D((2, 2))(c2)
+        for mhd_file in mhd_files:
+            mhd_path = os.path.join(subset_path, mhd_file)
 
-    c3 = Conv2D(256, 3, activation='relu', padding='same')(p2)
-    c3 = Conv2D(256, 3, activation='relu', padding='same')(c3)
-    p3 = MaxPooling2D((2, 2))(c3)
+            # 流式处理每个CT文件
+            scan_data, meta = load_scan(mhd_path)
+            mask_data = create_mask(mhd_path)
 
-    # 瓶颈层
-    b = Conv2D(512, 3, activation='relu', padding='same')(p3)
-    b = Conv2D(512, 3, activation='relu', padding='same')(b)
-
-    # 解码器
-    u1 = UpSampling2D((2, 2))(b)
-    u1 = Concatenate()([u1, c3])
-    u1 = Conv2D(256, 3, activation='relu', padding='same')(u1)
-    u1 = Conv2D(256, 3, activation='relu', padding='same')(u1)
-
-    u2 = UpSampling2D((2, 2))(u1)
-    u2 = Concatenate()([u2, c2])
-    u2 = Conv2D(128, 3, activation='relu', padding='same')(u2)
-    u2 = Conv2D(128, 3, activation='relu', padding='same')(u2)
-
-    u3 = UpSampling2D((2, 2))(u2)
-    u3 = Concatenate()([u3, c1])
-    u3 = Conv2D(64, 3, activation='relu', padding='same')(u3)
-    u3 = Conv2D(64, 3, activation='relu', padding='same')(u3)
-
-    outputs = Conv2D(1, 1, activation='sigmoid')(u3)
-
-    model = Model(inputs, outputs)
-    return model
-
-
-def generate_slice_samples(data_dir, target_size=(256, 256)):
-    """生成平衡的切片样本"""
-    mhd_files = [f for f in os.listdir(data_dir) if f.endswith('.mhd')]
-
-    # 预加载所有有效切片
-    all_slices = []
-    for mhd_file in mhd_files:
-        mhd_path = os.path.join(data_dir, mhd_file)
-
-        # 加载扫描和掩码
-        scan_data, meta = load_scan(mhd_path)
-        mask_data = create_mask(mhd_path)
-
-        # 遍历每个切片
-        for z in range(scan_data.shape[0]):
-            scan_slice = scan_data[z]
-            mask_slice = mask_data[z]
-
-            # 判断是否包含结节
-            has_nodule = np.any(mask_slice > 0.5)
-            all_slices.append((scan_slice, mask_slice, has_nodule))
-
-    # 分离正负样本
-    positive = [x for x in all_slices if x[2]]
-    negative = [x for x in all_slices if not x[2]]
-
-    return positive, negative
+            for z in range(scan_data.shape[0]):
+                scan_slice = scan_data[z]
+                mask_slice = mask_data[z]
+                has_nodule = np.any(mask_slice > 0.5)
+                yield (scan_slice, mask_slice, has_nodule)
 
 
 def balanced_slice_generator(data_dir, batch_size=32, pos_ratio=0.5):
-    """平衡切片生成器（修复版本）"""
-    positive, negative = generate_slice_samples(data_dir)
-
-    pos_batch = int(batch_size * pos_ratio)
-    neg_batch = batch_size - pos_batch
+    pos_buffer, neg_buffer = [], []
+    buffer_size = 1000  # 控制内存占用的缓冲区大小
 
     while True:
-        # 随机选择样本（使用正确的random模块）
-        pos_samples = random.sample(positive, pos_batch) if len(positive) >= pos_batch else []
-        neg_samples = random.sample(negative, neg_batch) if len(negative) >= neg_batch else []
+        # 动态填充缓冲区
+        while len(pos_buffer) < batch_size * pos_ratio or len(neg_buffer) < batch_size * (1 - pos_ratio):
+            scan, mask, has_nodule = next(generate_slice_samples(data_dir))
+            if has_nodule:
+                pos_buffer.append((scan, mask))
+            else:
+                neg_buffer.append((scan, mask))
 
-        # 处理样本不足的情况
-        if not pos_samples and not neg_samples:
-            continue
-        elif not pos_samples:
-            neg_samples = random.sample(negative, batch_size)
-        elif not neg_samples:
-            pos_samples = random.sample(positive, batch_size)
+        # 从缓冲区采样
+        pos_samples = random.sample(pos_buffer, int(batch_size * pos_ratio))
+        neg_samples = random.sample(neg_buffer, batch_size - int(batch_size * pos_ratio))
 
+        # 组装batch
         batch = pos_samples + neg_samples
-        random.shuffle(batch)  # 这里也需要使用random模块
+        random.shuffle(batch)
 
-        # 转换为numpy数组
         X = np.array([x[0] for x in batch])
         y = np.array([x[1] for x in batch])
-
         yield X, y
-
 
 
 def augmented_generator(base_generator, datagen):
@@ -329,6 +363,17 @@ def augmented_generator(base_generator, datagen):
         yield np.array(aug_X), np.array(aug_y)
 
 
+def dice_coefficient(y_true, y_pred, smooth=1e-6):
+    """
+    Dice = (2*|X ∩ Y|) / (|X| + |Y|)
+         = 2*TP / (2*TP + FP + FN)
+    """
+    y_true_f = tf.cast(tf.keras.backend.flatten(y_true), tf.float32)
+    y_pred_f = tf.cast(tf.keras.backend.flatten(y_pred), tf.float32)
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
+
+
 # 主程序
 if __name__ == "__main__":
     configure_gpu()
@@ -344,14 +389,16 @@ if __name__ == "__main__":
     # val_gen = balanced_slice_generator(VAL_DIR, batch_size=16, pos_ratio=0.3)     # 独立的
     val_gen = balanced_slice_generator(DATA_DIR, batch_size=16, pos_ratio=0.3)
 
-    model = build_unet()
+    model = build_model()       # 使用更先进的模型结构
+    # model = build_unet()
     # model.compile(optimizer=Adam(learning_rate=1e-3), loss=combined_loss(alpha=0.8, gamma=2))
 
 
     model.compile(
         optimizer=Adam(learning_rate=1e-4),
         loss=AdaptiveCombinedLoss(initial_alpha=0.3, gamma=3.0),
-        metrics=[tf.keras.metrics.Precision(name='prec'),
+        metrics=[dice_coefficient,
+        tf.keras.metrics.Precision(name='prec'),
                  tf.keras.metrics.Recall(name='rec')]
     )
 
@@ -369,8 +416,8 @@ if __name__ == "__main__":
         width_shift_range=0.1,
         height_shift_range=0.1
     )
-    # 创建增强后的生成器
-    train_gen = augmented_generator(train_gen, datagen)
+    # 创建增强后的生成器 （先不增强）
+    # train_gen = augmented_generator(train_gen, datagen)
 
     # 训练模型
     model.fit(
