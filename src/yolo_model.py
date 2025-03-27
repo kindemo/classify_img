@@ -127,12 +127,27 @@ class PANet(Model):
 
         return x_small, y_medium, route_large
 
+# class YOLOHead(layers.Layer):
+#     def __init__(self, filters, num_anchors, num_classes):
+#         super().__init__()
+#         self.conv1 = ConvBNMish(filters, 3)
+#         self.conv2 = layers.Conv2D(num_anchors * (5 + num_classes), 1,
+#                                    kernel_initializer=initializers.HeNormal())
+#
+#     def call(self, inputs):
+#         x = self.conv1(inputs)
+#         return self.conv2(x)
+
 class YOLOHead(layers.Layer):
     def __init__(self, filters, num_anchors, num_classes):
         super().__init__()
         self.conv1 = ConvBNMish(filters, 3)
-        self.conv2 = layers.Conv2D(num_anchors * (5 + num_classes), 1,
-                                   kernel_initializer=initializers.HeNormal())
+        # 添加输出正则化
+        self.conv2 = layers.Conv2D(
+            num_anchors * (5 + num_classes), 1,
+            kernel_initializer=initializers.RandomNormal(mean=0.0, stddev=0.01),  # 更小的初始化
+            kernel_regularizer='l2'
+        )
 
     def call(self, inputs):
         x = self.conv1(inputs)

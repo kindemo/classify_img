@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-
+import tensorflow as tf
 from src.yolo_mini import ANCHORS
 
 
@@ -76,27 +76,4 @@ def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
-def visualize_detections(image, boxes, scores, class_ids, class_names):
-    """可视化检测结果"""
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image[0, ..., 0], cmap='gray')
-    ax = plt.gca()
-
-    for box, score, class_id in zip(boxes, scores, class_ids):
-        x1, y1, x2, y2 = box
-        width = x2 - x1
-        height = y2 - y1
-
-        # 绘制边界框
-        rect = Rectangle((x1, y1), width, height,
-                         fill=False, color='red', linewidth=2)
-        ax.add_patch(rect)
-
-        # 添加标签
-        label = f"{class_names[class_id]}: {score:.2f}"
-        plt.text(x1, y1 - 5, label, color='red',
-                 fontsize=10, fontweight='bold')
-
-    plt.axis('off')
-    plt.show()
 
