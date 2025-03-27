@@ -1,21 +1,18 @@
 # batch_test_model.py
 import os
 import numpy as np
-import SimpleITK as sitk
-import tensorflow as tf
 import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from multiprocessing import Pool
 
-from src.illation import load_test_scan
-from src.main2 import dice_loss
+from src.illation_model.illation import load_test_scan
 from utils import *
 
 # 配置参数
 TEST_DIR = 'D:/BaiduNetdiskDownload/LUNA16/subset0'  # 测试集目录
-MODEL_PATH = 'D:/PycharmProjects/classify_img/saved'
-OUTPUT_DIR = './predictions'  # 预测结果存储目录
+MODEL_PATH = '/saved'
+OUTPUT_DIR = '../predictions'  # 预测结果存储目录
 BATCH_SIZE = 8
 WORKERS = 4  # 并行处理进程数
 

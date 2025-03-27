@@ -19,7 +19,7 @@ DATA_DIR = 'D:/BaiduNetdiskDownload/LUNA16/'
 ANNOTATION_FILE = 'D:/BaiduNetdiskDownload/LUNA16/CSVFILES/annotations.csv'
 TARGET_SIZE = (256, 256)
 # 创建独立的验证集目录
-VAL_DIR = 'D:/BaiduNetdiskDownload/LUNA16/validation_subset9'
+# VAL_DIR = 'D:/BaiduNetdiskDownload/LUNA16/validation_subset9'
 
 
 # 全局加载标注数据
@@ -373,9 +373,6 @@ def generate_slice_samples(data_dir):
         for mhd_file in mhd_files:
             mhd_path = os.path.join(subset_path, mhd_file)
             image = sitk.ReadImage(mhd_path)
-            depth = image.GetDepth()
-
-            # 获取全局元数据
             meta = {
                 'spacing': image.GetSpacing(),
                 'origin': image.GetOrigin(),
@@ -383,19 +380,27 @@ def generate_slice_samples(data_dir):
                 'seriesuid': os.path.basename(mhd_path).split('.mhd')[0]
             }
 
-            # 逐层处理
-            for z in range(depth):
-                # 处理单层扫描
+            for z in range(image.GetDepth()):
+                # 逐层读取，避免加载整个3D数据
                 scan_slice = sitk.GetArrayFromImage(image[:, :, z]).astype(np.float32)
                 scan_slice = np.clip(scan_slice, -1000, 400)
                 scan_slice = (scan_slice + 1000) / 1400  # 标准化
-                scan_slice = tf.image.resize(np.expand_dims(scan_slice, -1), TARGET_SIZE).numpy()
 
-                # 生成单层掩码
+                # 调整尺寸（使用CPU）
+                with tf.device('/cpu:0'):
+                    scan_slice = tf.image.resize(
+                        np.expand_dims(scan_slice, -1),
+                        TARGET_SIZE
+                    ).numpy()
+
+                # 生成掩码
                 mask_slice = create_single_slice_mask(image, z, meta)
-
                 has_nodule = np.any(mask_slice > 0.5)
+
                 yield (scan_slice, mask_slice, has_nodule)
+
+                # 及时释放内存
+                del scan_slice, mask_slice
 
 
 def balanced_slice_generator(data_dir, batch_size=32, pos_ratio=0.5):
@@ -464,11 +469,12 @@ if __name__ == "__main__":
     # print(f"数据维度: {scans.shape}, Mask维度: {masks.shape}")
 
     # 构建并训练模型 (None, 256, 256, 1)
-    train_gen = balanced_slice_generator(DATA_DIR, batch_size=32, pos_ratio=0.5)
+    train_gen = balanced_slice_generator(DATA_DIR, batch_size=16, pos_ratio=0.5)
 
     # 验证集生成器（可以单独划分验证目录）
-    # val_gen = balanced_slice_generator(VAL_DIR, batch_size=16, pos_ratio=0.3)     # 独立的
-    val_gen = balanced_slice_generator(DATA_DIR, batch_size=16, pos_ratio=0.3)
+    # val_gen = balanced_slice_generator(VAL_DIR, batch_size=4, pos_ratio=0.3)     # 独立的
+    # val_gen = balanced_slice_generator(DATA_DIR, batch_size=16, pos_ratio=0.3)
+    val_gen = train_gen     # 先测试为一样的
 
     # model = build_model()       # 使用更先进的模型结构
     model = build_unet()
@@ -503,10 +509,10 @@ if __name__ == "__main__":
     # 训练模型
     model.fit(
         train_gen,
-        steps_per_epoch=100,
-        epochs=20,
+        steps_per_epoch=8,
+        epochs=3,
         validation_data=val_gen,
-        validation_steps=50
+        validation_steps=4
     )
 
     # model.summary()

@@ -27,7 +27,7 @@ from main2 import dice_loss
 
 # 配置文件路径
 TEST_DATA_DIR = 'D:/BaiduNetdiskDownload/LUNA16/subset0'  # 替换为测试数据路径
-MODEL_PATH = 'D:/PycharmProjects/classify_img/saved'  # 替换为模型保存路径
+MODEL_PATH = '/saved'  # 替换为模型保存路径
 TARGET_SIZE = (256, 256)
 
 
