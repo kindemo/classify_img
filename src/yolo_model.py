@@ -3,6 +3,9 @@ from tensorflow.keras import Model, layers, initializers
 import numpy as np
 import cv2
 
+from src.config import Config
+
+
 class ConvBNMish(layers.Layer):
     def __init__(self, filters, kernel_size, strides=1, use_bias=False):
         super().__init__()
@@ -141,17 +144,21 @@ class PANet(Model):
 class YOLOHead(layers.Layer):
     def __init__(self, filters, num_anchors, num_classes):
         super().__init__()
+        self.num_anchors = num_anchors
+        self.num_classes = num_classes
         self.conv1 = ConvBNMish(filters, 3)
-        # 添加输出正则化
         self.conv2 = layers.Conv2D(
             num_anchors * (5 + num_classes), 1,
-            kernel_initializer=initializers.RandomNormal(mean=0.0, stddev=0.01),  # 更小的初始化
+            kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.01),
             kernel_regularizer='l2'
         )
 
     def call(self, inputs):
         x = self.conv1(inputs)
-        return self.conv2(x)
+        x = self.conv2(x)
+        # Reshape输出为 (batch, grid, grid, num_anchors, 5 + num_classes)
+        x = tf.reshape(x, (tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], self.num_anchors, 5 + self.num_classes))
+        return x
 
 
 class YOLOv4(Model):
@@ -170,6 +177,7 @@ class YOLOv4(Model):
         self.head_medium = YOLOHead(256, len(anchors[1]), num_classes)  # 中尺度26x26
         self.head_small = YOLOHead(128, len(anchors[2]), num_classes)  # 小尺度52x52
 
+
     def call(self, inputs):
         route_small, route_medium, route_large = self.backbone(inputs)
         x = self.spp(route_large)
@@ -183,281 +191,220 @@ class YOLOv4(Model):
         )
 
 
-class YOLOv4Loss(tf.keras.losses.Loss):
-    def __init__(self, anchors, num_classes, input_size, label_smoothing=0.1):
+class YoloLoss(tf.keras.losses.Loss):
+    def __init__(self, config):
         super().__init__()
-        self.anchors = np.array(anchors)
-        self.num_classes = num_classes
-        self.input_size = (input_size, input_size) if isinstance(input_size, int) else input_size[:2]
-        self.label_smoothing = label_smoothing
-        self.epsilon = 1e-9
-
-    def _process_predictions(self, pred, anchors, scale):
-        grid_size = tf.shape(pred)[1]
-        pred = tf.reshape(pred, [-1, grid_size, grid_size, 3, 5 + self.num_classes])
-        box_xy = tf.sigmoid(pred[..., 0:2])
-        box_wh = tf.exp(pred[..., 2:4]) * anchors / self.input_size[0]
-        conf = tf.sigmoid(pred[..., 4:5])
-        prob = tf.sigmoid(pred[..., 5:])
-        return box_xy, box_wh, conf, prob
-
-    def _ciou_loss(self, boxes1, boxes2):
-        b1_xy, b1_wh = boxes1[..., 0:2], boxes1[..., 2:4]
-        b1_min = b1_xy - b1_wh / 2
-        b1_max = b1_xy + b1_wh / 2
-        b2_xy, b2_wh = boxes2[..., 0:2], boxes2[..., 2:4]
-        b2_min = b2_xy - b2_wh / 2
-        b2_max = b2_xy + b2_wh / 2
-
-        intersect_min = tf.maximum(b1_min, b2_min)
-        intersect_max = tf.minimum(b1_max, b2_max)
-        intersect_wh = tf.maximum(intersect_max - intersect_min, 0.0)
-        intersect_area = intersect_wh[..., 0] * intersect_wh[..., 1]
-
-        b1_area = b1_wh[..., 0] * b1_wh[..., 1]
-        b2_area = b2_wh[..., 0] * b2_wh[..., 1]
-        union_area = b1_area + b2_area - intersect_area
-
-        iou = intersect_area / (union_area + self.epsilon)
-        center_distance = tf.reduce_sum(tf.square(b1_xy - b2_xy), axis=-1)
-
-        enclose_min = tf.minimum(b1_min, b2_min)
-        enclose_max = tf.maximum(b1_max, b2_max)
-        enclose_wh = enclose_max - enclose_min
-        enclose_diagonal = tf.reduce_sum(tf.square(enclose_wh), axis=-1)
-
-        v = (4 / (np.pi ** 2)) * tf.square(
-            tf.math.atan(b1_wh[..., 0] / (b1_wh[..., 1] + self.epsilon)) -
-            tf.math.atan(b2_wh[..., 0] / (b2_wh[..., 1] + self.epsilon))
-        )
-        alpha = v / (1 - iou + v + self.epsilon)
-        ciou = iou - (center_distance / (enclose_diagonal + self.epsilon) + alpha * v)
-        return 1.0 - ciou
+        self.config = config
+        self.num_classes = config.num_classes
 
     def call(self, y_true, y_pred):
-        total_loss = 0.0
-        for scale in range(3):
-            pred = y_pred[scale]
-            true = y_true[scale]
+        # 确保输入维度正确
+        assert y_pred.shape[-1] == 5 + self.num_classes
+        assert y_true.shape[-1] == 5 + self.num_classes
 
-            grid_size = tf.shape(pred)[1]
-            tf.debugging.assert_equal(
-                tf.shape(true)[1],
-                grid_size,
-                message=f"Scale {scale} grid_size mismatch"
-            )
+        # 提取物体掩码并调整维度
+        obj_mask = tf.expand_dims(y_true[..., 4], axis=-1)  # (batch, grid, grid, anchors, 1)
 
-            # 处理预测值
-            anchors = self.anchors[scale]
-            box_xy, box_wh, conf, prob = self._process_predictions(pred, anchors, scale)
+        # 坐标损失（仅对有物体的位置计算）
+        pred_box = y_pred[..., :4]
+        true_box = y_true[..., :4]
+        coord_loss = tf.reduce_sum(obj_mask * tf.square(true_box - pred_box), axis=[1, 2, 3, 4])
 
-            # 处理真实值
-            true_box_xy = true[..., 0:2]
-            true_box_wh = true[..., 2:4]
-            true_conf = true[..., 4:5]
-            true_cls = true[..., 5:]  # 注意这里不需要添加批次维度
+        # 置信度损失（Sigmoid处理）
+        pred_conf = tf.sigmoid(y_pred[..., 4:5])
+        true_conf = y_true[..., 4:5]
+        conf_loss = tf.keras.losses.binary_crossentropy(true_conf, pred_conf)
+        conf_loss = tf.reduce_sum(conf_loss * tf.squeeze(obj_mask, axis=-1), axis=[1, 2, 3])
 
-            # 确保true_cls和prob形状匹配
-            true_cls = tf.expand_dims(true_cls, axis=0)  # 添加类别维度
+        # 分类损失（Sigmoid处理）
+        pred_cls = tf.sigmoid(y_pred[..., 5:5 + self.num_classes])
+        true_cls = y_true[..., 5:5 + self.num_classes]
+        cls_loss = tf.keras.losses.binary_crossentropy(true_cls, pred_cls)
+        cls_loss = tf.reduce_sum(cls_loss * tf.squeeze(obj_mask, axis=-1), axis=[1, 2, 3])
 
-            # 计算分类损失
-            prob_loss = tf.keras.losses.binary_crossentropy(
-                true_cls,
-                prob,
-                from_logits=False,
-                label_smoothing=self.label_smoothing
-            )
-
-            # 应用对象掩码
-            obj_mask = tf.squeeze(true_conf, axis=-1)  # 去除最后一个维度
-            prob_loss = tf.reduce_sum(prob_loss * obj_mask) / (tf.reduce_sum(obj_mask) + self.epsilon)
-
-            total_loss += prob_loss
+        # 总损失（保持batch维度）
+        total_loss = coord_loss + conf_loss + cls_loss
         return total_loss
 
-
-
-
-
-
-class NoduleDetector:
-    def __init__(self, model_path, anchors, input_size=(416, 416), conf_thresh=0.5, iou_thresh=0.4):
-        # 加载模型时注册所有自定义对象
-        self.model = tf.keras.models.load_model(
-            model_path,
-            custom_objects={'YOLOv4Loss': YOLOv4Loss}
-        )
-        self.anchors = np.array(anchors)  # 转换为numpy数组
-        self.conf_thresh = conf_thresh
-        self.iou_thresh = iou_thresh
-        self.input_size = input_size
-        # 定义不同尺度对应的锚框索引
-        self.anchor_masks = [[6, 7, 8], [3, 4, 5], [0, 1, 2]]  # 对应大、中、小三个尺度
-
-    def non_max_suppression(self, boxes, scores, classes):
-        """改进后的NMS实现，支持多类别"""
-        selected_indices = tf.image.non_max_suppression(
-            boxes, scores,
-            max_output_size=100,
-            iou_threshold=self.iou_thresh,
-            score_threshold=self.conf_thresh
-        )
-        selected_boxes = tf.gather(boxes, selected_indices)
-        selected_scores = tf.gather(scores, selected_indices)
-        selected_classes = tf.gather(classes, selected_indices)
-        return selected_boxes, selected_scores, selected_classes
-
-    def decode_scale_pred(self, pred, scale_idx):
-        """解码单个尺度的预测结果"""
-        anchors = self.anchors[self.anchor_masks[scale_idx]]
-        grid_size = pred.shape[1]  # 特征图尺寸 (h, w)
-        pred = tf.reshape(pred, [1, grid_size, grid_size, len(anchors), 5 + 1])  # 假设num_classes=1
-
-        # 分解预测分量
-        box_xy = tf.sigmoid(pred[..., 0:2])
-        box_wh = tf.exp(pred[..., 2:4]) * anchors / self.input_size[0]
-        conf = tf.sigmoid(pred[..., 4:5])
-        prob = tf.sigmoid(pred[..., 5:6])  # 假设单分类
-
-        # 生成网格坐标
-        grid_y, grid_x = tf.meshgrid(
-            tf.range(grid_size, dtype=tf.float32),
-            tf.range(grid_size, dtype=tf.float32)
-        )
-        grid = tf.stack([grid_x, grid_y], axis=-1)
-        grid = tf.expand_dims(grid, 2)  # (h, w, 1, 2)
-
-        # 转换到全局坐标
-        box_xy = (box_xy + grid) / grid_size
-        boxes = tf.concat([box_xy, box_wh], axis=-1)  # [x_center, y_center, width, height]
-
-        # 转换为角点坐标
-        boxes_corners = tf.concat([
-            boxes[..., 0:2] - boxes[..., 2:4] / 2,  # xmin, ymin
-            boxes[..., 0:2] + boxes[..., 2:4] / 2  # xmax, ymax
-        ], axis=-1)
-
-        # 展平结果
-        boxes_corners = tf.reshape(boxes_corners, [-1, 4])
-        conf = tf.reshape(conf, [-1])
-        prob = tf.reshape(prob, [-1])
-        scores = conf * prob  # 综合置信度
-
-        # 过滤低置信度
-        valid_mask = scores > self.conf_thresh
-        boxes_corners = tf.boolean_mask(boxes_corners, valid_mask)
-        scores = tf.boolean_mask(scores, valid_mask)
-        classes = tf.ones_like(scores, dtype=tf.int32)  # 单分类问题
-
-        return boxes_corners, scores, classes
-
-    def decode_predictions(self, preds):
-        """合并三个尺度的预测结果"""
-        all_boxes = []
-        all_scores = []
-        all_classes = []
-
-        for scale in range(3):
-            boxes, scores, classes = self.decode_scale_pred(preds[scale], scale)
-            all_boxes.append(boxes)
-            all_scores.append(scores)
-            all_classes.append(classes)
-
-        # 合并所有预测
-        boxes = tf.concat(all_boxes, axis=0)
-        scores = tf.concat(all_scores, axis=0)
-        classes = tf.concat(all_classes, axis=0)
-
-        # 执行NMS
-        if boxes.shape[0] > 0:
-            final_boxes, final_scores, final_classes = self.non_max_suppression(
-                boxes, scores, classes)
-        else:
-            return np.array([]), np.array([]), np.array([])
-
-        return final_boxes.numpy(), final_scores.numpy(), final_classes.numpy()
-
-    def preprocess_image(self, image):
-        """改进的预处理流程，保持比例的缩放和填充"""
-        # 转换为单通道
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-
-        # 获取原始尺寸
-        h, w = image.shape[:2]
-
-        # 计算缩放比例
-        scale = min(self.input_size[0] / h, self.input_size[1] / w)
-        new_h, new_w = int(h * scale), int(w * scale)
-
-        # 保持比例的缩放
-        resized = cv2.resize(image, (new_w, new_h))
-
-        # 创建填充图像
-        padded = np.zeros(self.input_size, dtype=np.float32)
-        dh = (self.input_size[0] - new_h) // 2
-        dw = (self.input_size[1] - new_w) // 2
-        padded[dh:dh + new_h, dw:dw + new_w] = resized
-
-        # 添加批次和通道维度
-        return np.expand_dims(padded, axis=(0, -1)) / 255.0
-
-    def detect(self, ct_volume):
-        """改进后的检测流程"""
-        detections = []
-
-        for slice_idx in range(ct_volume.shape[0]):
-            # 获取CT切片
-            slice_img = ct_volume[slice_idx].astype(np.float32)
-
-            try:
-                # 预处理
-                processed = self.preprocess_image(slice_img)
-
-                # 模型预测
-                preds = self.model(processed)
-
-                # 解码预测结果
-                boxes, scores, classes = self.decode_predictions(preds)
-
-                # 转换回原始坐标
-                if len(boxes) > 0:
-                    # 去除填充
-                    scale = min(self.input_size[0] / slice_img.shape[0],
-                                self.input_size[1] / slice_img.shape[1])
-                    new_h = int(slice_img.shape[0] * scale)
-                    new_w = int(slice_img.shape[1] * scale)
-                    dh = (self.input_size[0] - new_h) // 2
-                    dw = (self.input_size[1] - new_w) // 2
-
-                    # 调整坐标到原始尺寸
-                    boxes[:, [0, 2]] = (boxes[:, [0, 2]] * self.input_size[1] - dw) / scale
-                    boxes[:, [1, 3]] = (boxes[:, [1, 3]] * self.input_size[0] - dh) / scale
-
-                    # 限制边界
-                    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, slice_img.shape[1])
-                    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, slice_img.shape[0])
-
-            except Exception as e:
-                print(f"Error processing slice {slice_idx}: {str(e)}")
-                boxes = np.array([])
-                scores = np.array([])
-                classes = np.array([])
-
-            detections.append({
-                "slice": slice_idx,
-                "boxes": boxes,
-                "scores": scores,
-                "classes": classes
-            })
-
-        return detections
+# class NoduleDetector:
+#     def __init__(self, model_path, anchors, input_size=(416, 416), conf_thresh=0.5, iou_thresh=0.4):
+#         # 加载模型时注册所有自定义对象
+#         self.model = tf.keras.models.load_model(
+#             model_path,
+#             custom_objects={'YOLOv4Loss': YOLOv4Loss}
+#         )
+#         self.anchors = np.array(anchors)  # 转换为numpy数组
+#         self.conf_thresh = conf_thresh
+#         self.iou_thresh = iou_thresh
+#         self.input_size = input_size
+#         # 定义不同尺度对应的锚框索引
+#         self.anchor_masks = [[6, 7, 8], [3, 4, 5], [0, 1, 2]]  # 对应大、中、小三个尺度
+#
+#     def non_max_suppression(self, boxes, scores, classes):
+#         """改进后的NMS实现，支持多类别"""
+#         selected_indices = tf.image.non_max_suppression(
+#             boxes, scores,
+#             max_output_size=100,
+#             iou_threshold=self.iou_thresh,
+#             score_threshold=self.conf_thresh
+#         )
+#         selected_boxes = tf.gather(boxes, selected_indices)
+#         selected_scores = tf.gather(scores, selected_indices)
+#         selected_classes = tf.gather(classes, selected_indices)
+#         return selected_boxes, selected_scores, selected_classes
+#
+#     def decode_scale_pred(self, pred, scale_idx):
+#         """解码单个尺度的预测结果"""
+#         anchors = self.anchors[self.anchor_masks[scale_idx]]
+#         grid_size = pred.shape[1]  # 特征图尺寸 (h, w)
+#         pred = tf.reshape(pred, [1, grid_size, grid_size, len(anchors), 5 + 1])  # 假设num_classes=1
+#
+#         # 分解预测分量
+#         box_xy = tf.sigmoid(pred[..., 0:2])
+#         box_wh = tf.exp(pred[..., 2:4]) * anchors / self.input_size[0]
+#         conf = tf.sigmoid(pred[..., 4:5])
+#         prob = tf.sigmoid(pred[..., 5:6])  # 假设单分类
+#
+#         # 生成网格坐标
+#         grid_y, grid_x = tf.meshgrid(
+#             tf.range(grid_size, dtype=tf.float32),
+#             tf.range(grid_size, dtype=tf.float32)
+#         )
+#         grid = tf.stack([grid_x, grid_y], axis=-1)
+#         grid = tf.expand_dims(grid, 2)  # (h, w, 1, 2)
+#
+#         # 转换到全局坐标
+#         box_xy = (box_xy + grid) / grid_size
+#         boxes = tf.concat([box_xy, box_wh], axis=-1)  # [x_center, y_center, width, height]
+#
+#         # 转换为角点坐标
+#         boxes_corners = tf.concat([
+#             boxes[..., 0:2] - boxes[..., 2:4] / 2,  # xmin, ymin
+#             boxes[..., 0:2] + boxes[..., 2:4] / 2  # xmax, ymax
+#         ], axis=-1)
+#
+#         # 展平结果
+#         boxes_corners = tf.reshape(boxes_corners, [-1, 4])
+#         conf = tf.reshape(conf, [-1])
+#         prob = tf.reshape(prob, [-1])
+#         scores = conf * prob  # 综合置信度
+#
+#         # 过滤低置信度
+#         valid_mask = scores > self.conf_thresh
+#         boxes_corners = tf.boolean_mask(boxes_corners, valid_mask)
+#         scores = tf.boolean_mask(scores, valid_mask)
+#         classes = tf.ones_like(scores, dtype=tf.int32)  # 单分类问题
+#
+#         return boxes_corners, scores, classes
+#
+#     def decode_predictions(self, preds):
+#         """合并三个尺度的预测结果"""
+#         all_boxes = []
+#         all_scores = []
+#         all_classes = []
+#
+#         for scale in range(3):
+#             boxes, scores, classes = self.decode_scale_pred(preds[scale], scale)
+#             all_boxes.append(boxes)
+#             all_scores.append(scores)
+#             all_classes.append(classes)
+#
+#         # 合并所有预测
+#         boxes = tf.concat(all_boxes, axis=0)
+#         scores = tf.concat(all_scores, axis=0)
+#         classes = tf.concat(all_classes, axis=0)
+#
+#         # 执行NMS
+#         if boxes.shape[0] > 0:
+#             final_boxes, final_scores, final_classes = self.non_max_suppression(
+#                 boxes, scores, classes)
+#         else:
+#             return np.array([]), np.array([]), np.array([])
+#
+#         return final_boxes.numpy(), final_scores.numpy(), final_classes.numpy()
+#
+#     def preprocess_image(self, image):
+#         """改进的预处理流程，保持比例的缩放和填充"""
+#         # 转换为单通道
+#         if len(image.shape) == 3 and image.shape[2] == 3:
+#             image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+#
+#         # 获取原始尺寸
+#         h, w = image.shape[:2]
+#
+#         # 计算缩放比例
+#         scale = min(self.input_size[0] / h, self.input_size[1] / w)
+#         new_h, new_w = int(h * scale), int(w * scale)
+#
+#         # 保持比例的缩放
+#         resized = cv2.resize(image, (new_w, new_h))
+#
+#         # 创建填充图像
+#         padded = np.zeros(self.input_size, dtype=np.float32)
+#         dh = (self.input_size[0] - new_h) // 2
+#         dw = (self.input_size[1] - new_w) // 2
+#         padded[dh:dh + new_h, dw:dw + new_w] = resized
+#
+#         # 添加批次和通道维度
+#         return np.expand_dims(padded, axis=(0, -1)) / 255.0
+#
+#     def detect(self, ct_volume):
+#         """改进后的检测流程"""
+#         detections = []
+#
+#         for slice_idx in range(ct_volume.shape[0]):
+#             # 获取CT切片
+#             slice_img = ct_volume[slice_idx].astype(np.float32)
+#
+#             try:
+#                 # 预处理
+#                 processed = self.preprocess_image(slice_img)
+#
+#                 # 模型预测
+#                 preds = self.model(processed)
+#
+#                 # 解码预测结果
+#                 boxes, scores, classes = self.decode_predictions(preds)
+#
+#                 # 转换回原始坐标
+#                 if len(boxes) > 0:
+#                     # 去除填充
+#                     scale = min(self.input_size[0] / slice_img.shape[0],
+#                                 self.input_size[1] / slice_img.shape[1])
+#                     new_h = int(slice_img.shape[0] * scale)
+#                     new_w = int(slice_img.shape[1] * scale)
+#                     dh = (self.input_size[0] - new_h) // 2
+#                     dw = (self.input_size[1] - new_w) // 2
+#
+#                     # 调整坐标到原始尺寸
+#                     boxes[:, [0, 2]] = (boxes[:, [0, 2]] * self.input_size[1] - dw) / scale
+#                     boxes[:, [1, 3]] = (boxes[:, [1, 3]] * self.input_size[0] - dh) / scale
+#
+#                     # 限制边界
+#                     boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, slice_img.shape[1])
+#                     boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, slice_img.shape[0])
+#
+#             except Exception as e:
+#                 print(f"Error processing slice {slice_idx}: {str(e)}")
+#                 boxes = np.array([])
+#                 scores = np.array([])
+#                 classes = np.array([])
+#
+#             detections.append({
+#                 "slice": slice_idx,
+#                 "boxes": boxes,
+#                 "scores": scores,
+#                 "classes": classes
+#             })
+#
+#         return detections
 
 
 # 使用示例
 if __name__ == "__main__":
+    config = Config()
     # 初始化检测器
-    detector = NoduleDetector("best_model.h5", ANCHORS)
+    detector = NoduleDetector("best_model.h5", config.anchors)
 
     # 加载CT序列（示例数据）
     sample_ct = np.load("sample_ct.npy")  # shape: (depth, height, width)

@@ -5,9 +5,8 @@ import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from multiprocessing import Pool
+from src.sample.illation import load_test_scan
 
-from src.illation_model.illation import load_test_scan
-from utils import *
 
 # 配置参数
 TEST_DIR = 'D:/BaiduNetdiskDownload/LUNA16/subset0'  # 测试集目录

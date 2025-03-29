@@ -10,41 +10,13 @@ from PIL import Image
 import cv2
 import tensorflow as tf
 from PIL.ImageOps import scale
+from keras.callbacks import ModelCheckpoint
 from scipy import ndimage
 
+from src.YoloLabelGenerator import YOLOLabelGenerator
+from src.config import config
 from src.yolo_model import CSPDarknet53, PANet, YOLOHead
 
-
-# 配置文件
-class LunaConfig:
-    def __init__(self):
-        # 数据路径
-        self.raw_data_dir = "D:\BaiduNetdiskDownload\LUNA16\subset0"
-        self.processed_dir = "D:\BaiduNetdiskDownload\LUNA16\processed"
-        self.annotation_csv = "D:/BaiduNetdiskDownload/LUNA16/CSVFILES/annotations.csv"
-
-        # 验证路径
-        if not os.path.exists(self.raw_data_dir):
-            raise FileNotFoundError(f"原始数据目录不存在: {self.raw_data_dir}")
-        if not os.path.exists(self.annotation_csv):
-            raise FileNotFoundError(f"标注文件不存在: {self.annotation_csv}")
-
-
-        self.spacing = (1.0, 1.0, 1.0)  # 添加空间间距参数
-
-        # YOLO格式配置
-        self.img_size = (416, 416)  # 输入图像尺寸
-        self.grid_sizes = [52, 26, 13]  # YOLO特征图尺寸
-        self.anchors = [
-            [(12, 16), (19, 36), (40, 28)],  # 小尺度
-            [(36, 75), (76, 55), (72, 146)],  # 中尺度
-            [(142, 110), (192, 243), (459, 401)]  # 大尺度
-        ]
-
-        # 预处理参数
-        self.target_spacing = 1.0  # 体素标准化间距(mm)
-        self.cube_size = 32  # 截取立方体尺寸
-        self.hu_range = (-1000, 400)  # HU值截断范围
 
 
 def validate_annotations(config):
@@ -62,22 +34,96 @@ def validate_annotations(config):
         print("标注文件包含所有患者的标注数据")
 
 
-# LUNA16预处理类
-class LunaYoloPreprocessor:
+# 输出格式 (images, (large_labels, medium_labels, small_labels))
+def create_dataset(config, batch_size):
+    def _parse_yolo_data(img_path):
+        # 读取图像和标签（此处需确保标签与图像路径一一对应）
+        img = tf.io.read_file(img_path)
+        img = tf.image.decode_png(img, channels=3)
+        img = tf.image.resize(img, (config.input_size, config.input_size))
+        img = img / 255.0  # 归一化
+
+        # 生成标签路径
+        label_path = tf.strings.regex_replace(img_path, "images", "labels")
+        label_path = tf.strings.regex_replace(label_path, "\\.png$", ".txt")
+
+        # 读取标签内容并解析为三个检测层的标签
+        label_content = tf.io.read_file(label_path)
+
+        # 解析标签函数
+        def process_labels(content):
+            content = content.numpy().decode('utf-8')
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
+
+            # 初始化三个检测层的标签张量
+            large_label = np.zeros((13, 13, 3, 6), dtype=np.float32)
+            medium_label = np.zeros((26, 26, 3, 6), dtype=np.float32)
+            small_label = np.zeros((52, 52, 3, 6), dtype=np.float32)
+
+            for line in lines:
+                parts = line.split()
+                if len(parts) != 9:
+                    continue
+
+                scale = int(parts[0])
+                grid_x = int(parts[1])
+                grid_y = int(parts[2])
+                anchor_idx = int(parts[3])
+
+                tx = float(parts[4])
+                ty = float(parts[5])
+                tw = float(parts[6])
+                th = float(parts[7])
+                conf = float(parts[8])
+                class_id = int(parts[9])  # 新增分类解析
+
+                # 填充到对应检测层
+                if scale == 0 and grid_x < 13 and grid_y < 13 and anchor_idx < 3:
+                    large_label[grid_y, grid_x, anchor_idx] = [tx, ty, tw, th, conf, class_id]
+                elif scale == 1 and grid_x < 26 and grid_y < 26 and anchor_idx < 3:
+                    medium_label[grid_y, grid_x, anchor_idx] = [tx, ty, tw, th, conf, class_id]
+                elif scale == 2 and grid_x < 52 and grid_y < 52 and anchor_idx < 3:
+                    small_label[grid_y, grid_x, anchor_idx] = [tx, ty, tw, th, conf, class_id]
+
+            return large_label, medium_label, small_label
+
+        # 调用处理函数并设置形状
+        large, medium, small = tf.py_function(
+            process_labels, [label_content], [tf.float32, tf.float32, tf.float32]
+        )
+        large.set_shape((13, 13, 3, 5))
+        medium.set_shape((26, 26, 3, 5))
+        small.set_shape((52, 52, 3, 5))
+
+        return img, (large, medium, small)
+
+    # 构建数据集（确保返回格式为 (images, (large_labels, medium_labels, small_labels))）
+    img_files = tf.data.Dataset.list_files(f"{config.processed_dir}/images/*.png")
+    dataset = img_files.map(_parse_yolo_data, num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+
+class LunaYoloPreprocessor():
     def __init__(self, config):
         self.config = config
         self._create_dirs()
-        self.file_counter = 0  # 新增文件计数器
+        self.file_counter = 0
+        self.label_generator = YOLOLabelGenerator(config)  # 组合标签生成器
+
+        # 确保路径正确
+        self.config.image_dir = str(Path(self.config.processed_dir) / "images")
+        self.config.label_dir = str(Path(self.config.processed_dir) / "labels")
 
     def _create_dirs(self):
-        """安全创建目录（兼容Windows）"""
-        images_dir = Path(self.config.processed_dir) / "images"
-        labels_dir = Path(self.config.processed_dir) / "labels"
+        """创建图像和标签目录，并验证可写性"""
+        images_dir = Path(self.config.image_dir)
+        labels_dir = Path(self.config.label_dir)
 
         images_dir.mkdir(parents=True, exist_ok=True)
         labels_dir.mkdir(parents=True, exist_ok=True)
 
-        # 验证目录可写性
+        # 验证可写性
         test_file = images_dir / "test.txt"
         try:
             test_file.write_text("test")
@@ -85,262 +131,177 @@ class LunaYoloPreprocessor:
         except Exception as e:
             raise PermissionError(f"目录不可写: {images_dir}，错误: {str(e)}")
 
-    def _process_patient(self, mhd_path, df_annotations):
-        """统一处理单个患者的CT扫描和标注数据"""
-        # 规范患者ID格式
-        patient_id = os.path.basename(mhd_path).replace(".mhd", "").strip()
-        print(f"\n正在处理患者: {patient_id}")
-
-        try:
-            # 加载CT扫描数据
-            ct_scan = self._load_ct_scan(mhd_path)
-        except Exception as e:
-            print(f"CT扫描加载失败: {str(e)}")
-            return
-
-        # 统一获取标注数据（带空格处理）
-        if 'seriesuid' not in df_annotations.columns:
-            raise KeyError("标注文件中缺少seriesuid列")
-
-        # 精确匹配标注（带空格处理）
-        patient_annots = df_annotations[
-            df_annotations['seriesuid'].str.strip() == patient_id
-            ]
-
-        # 标注存在性检查
-        if patient_annots.empty:
-            print(f"警告: 患者 {patient_id} 无有效标注")
-            print(f"标注示例: {df_annotations['seriesuid'].iloc[0]}")
-            return
-
-        print(f"发现 {len(patient_annots)} 个有效结节标注")
-
-        # 处理每个结节标注
-        for idx, annot in patient_annots.iterrows():
-            try:
-                # 添加进度显示
-                print(f"处理结节 {idx + 1}/{len(patient_annots)}", end='\r')
-                self._process_nodule(ct_scan, annot, patient_id)
-            except Exception as e:
-                print(f"\n结节处理失败: {str(e)}")
-                continue
-
-        print(f"\n患者 {patient_id} 处理完成")
-
-    def _generate_yolo_label(self, img_shape, annot, img_path):
-        """生成YOLO标注文件（增加参数验证）"""
-        # 参数验证
-        if not Path(img_path).exists():
-            raise FileNotFoundError(f"图像文件不存在: {img_path}")
-
-        if img_shape[0] <= 0 or img_shape[1] <= 0:
-            raise ValueError(f"无效的图像尺寸: {img_shape}")
-
-        # 坐标转换（添加边界检查）
-        x_center = 0.5
-        y_center = 0.5
-        width = np.clip(annot['diameter_mm'] / (self.config.cube_size * self.config.spacing[0]), 0, 1)
-        height = np.clip(annot['diameter_mm'] / (self.config.cube_size * self.config.spacing[1]), 0, 1)
-
-        # 构建标注内容
-        label_line = f"{scale} {x_center} {y_center} {width} {height}\n"
-
-        # 保存标注
-        label_path = Path(img_path).parent.parent / "labels" / Path(img_path).name.replace(".png", ".txt")
-        label_path.write_text(label_line)
-        return label_path
-
-    def _load_ct_scan(self, mhd_path):
-        """加载CT扫描（添加详细错误信息）"""
-        try:
-            itk_image = sitk.ReadImage(str(mhd_path))  # 确保路径为字符串
-            img_array = sitk.GetArrayFromImage(itk_image)
-
-            # 添加CT元数据验证
-            if img_array.size == 0:
-                raise ValueError("CT数据为空")
-
-            # 标准化处理
-            img_array = np.clip(img_array, *self.config.hu_range)
-            img_array = cv2.normalize(img_array, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-
-            return {
-                'data': img_array,
-                'origin': itk_image.GetOrigin(),
-                'spacing': itk_image.GetSpacing()
-            }
-        except Exception as e:
-            print(f"加载CT文件失败: {mhd_path}")
-            raise
-
-    def process_dataset(self):
-        """处理整个数据集（添加进度跟踪）"""
-        try:
-            df_annotations = pd.read_csv(self.config.annotation_csv)
-            total_files = len(glob.glob(f"{self.config.raw_data_dir}/*.mhd"))
-
-            for idx, mhd_file in enumerate(glob.glob(f"{self.config.raw_data_dir}/*.mhd")):
-                patient_id = os.path.basename(mhd_file).split('.')[0]
-                print(f"Processing {idx + 1}/{total_files}: {patient_id}")
-                self._process_patient(mhd_file, patient_id, df_annotations)
-
-            print(f"预处理成功完成! 生成文件保存在: {self.config.processed_dir}")
-        except Exception as e:
-            print(f"预处理失败: {str(e)}")
-            raise
-
-    def _process_nodule(self, ct_scan, annot, patient_id):
-        """处理单个结节"""
-        # 坐标转换
-        world_coord = np.array([annot['coordX'], annot['coordY'], annot['coordZ']])
-        voxel_coord = self._world_to_voxel(world_coord, ct_scan['origin'], ct_scan['spacing'])
-
-        # 截取立方体
-        cube = self._extract_cube(ct_scan['data'], voxel_coord)
-
-        # 生成多尺度数据
-        for scale in range(3):
-            self._generate_scale_data(cube, annot, patient_id, scale)
-
-    def _world_to_voxel(self, world_coord, origin, spacing):
-        """世界坐标转体素坐标"""
-        return (world_coord - origin) / spacing
-
     def _extract_cube(self, img_3d, center_voxel):
-        """截取3D立方体"""
+        """提取3D立方体（确保z,y,x顺序与CT数据对齐）"""
         size = self.config.cube_size
-        z, y, x = center_voxel.astype(int)
+        z, y, x = center_voxel  # 已修正为z,y,x顺序
 
-        # 边界保护
+        # 计算各维度起止索引
         z_start = max(z - size // 2, 0)
+        z_end = min(z_start + size, img_3d.shape[0])
         y_start = max(y - size // 2, 0)
+        y_end = min(y_start + size, img_3d.shape[1])
         x_start = max(x - size // 2, 0)
+        x_end = min(x_start + size, img_3d.shape[2])
 
-        return img_3d[z_start:z_start + size, y_start:y_start + size, x_start:x_start + size]
+        # 处理边界溢出
+        cube = np.zeros((size, size, size), dtype=img_3d.dtype)
 
-    # 修改后的_generate_scale_data方法
+        # 计算实际填充区域
+        actual_z_slice = slice(z_start, z_end)
+        actual_y_slice = slice(y_start, y_end)
+        actual_x_slice = slice(x_start, x_end)
+
+        # 填充数据
+        cube_z_start = max(0, (size // 2) - (z - z_start))
+        cube_z_end = cube_z_start + (z_end - z_start)
+
+        cube[cube_z_start:cube_z_end, :, :] = img_3d[actual_z_slice, actual_y_slice, actual_x_slice]
+        return cube
+
     def _generate_scale_data(self, cube, annot, patient_id, scale):
-        """生成不同尺度的训练数据（修复3D缩放问题）"""
+        """生成不同尺度的图像和标签"""
         target_size = self.config.grid_sizes[scale]
+        cube_size = self.config.cube_size
 
-        # 直接进行三维缩放（无需预初始化）
+        # 三维缩放
         zoom_factor = [
             target_size / cube.shape[0],
             target_size / cube.shape[1],
             target_size / cube.shape[2]
         ]
-
         scaled_cube = ndimage.zoom(cube, zoom_factor, order=1)
 
-        # 保存图像切片
+        # 假设结节占据整个立方体，归一化尺寸为1.0（根据实际需求调整）
+        norm_x = 0.5  # 中心坐标
+        norm_y = 0.5
+        norm_w = 1.0  # 占据整个图像宽度
+        norm_h = 1.0  # 占据整个图像高度
+
+        # 生成所有切片
         for z in range(scaled_cube.shape[0]):
-            img_slice = scaled_cube[z]
-            img_path = f"{self.config.processed_dir}/images/{patient_id}_s{scale}_z{z}.png"
-            cv2.imwrite(img_path, img_slice)
-            self._create_yolo_label(img_path, annot, scale)
+            img_name = f"{patient_id}_s{scale}_z{z}.png"
+            img_path = os.path.join(self.config.image_dir, img_name)
+            cv2.imwrite(img_path, scaled_cube[z])
 
-    def _create_yolo_label(self, img_path, annot, scale):
-        """生成YOLO标注文件"""
-        # 计算归一化坐标
-        diameter = annot['diameter_mm']
-        x_center = 0.5  # 立方体中心
-        y_center = 0.5
-        width = diameter / (self.config.cube_size * self.config.spacing[0])
-        height = diameter / (self.config.cube_size * self.config.spacing[1])
+            # 构造标签信息
+            slice_annot = {
+                'seriesuid': img_name.replace('.png', ''),
+                'x_center': norm_x,
+                'y_center': norm_y,
+                'width': norm_w,
+                'height': norm_h
+            }
 
-        # 构建标注内容
-        label_line = f"{scale} {x_center} {y_center} {width} {height}\n"
+            # 生成标签
+            self.label_generator.create_scale_label(img_path, slice_annot, scale)
 
-        # 保存标注
-        label_path = img_path.replace("images", "labels").replace(".png", ".txt")
-        with open(label_path, 'w') as f:
-            f.write(label_line)
+    @staticmethod
+    def _world_to_voxel(world_coord, origin, spacing):
+        """将世界坐标(x,y,z)转换为体素坐标(z,y,x)索引"""
+        voxel_x = (world_coord[0] - origin[0]) / spacing[0]
+        voxel_y = (world_coord[1] - origin[1]) / spacing[1]
+        voxel_z = (world_coord[2] - origin[2]) / spacing[2]
+        return np.round([voxel_z, voxel_y, voxel_x]).astype(int)  # 适配数组(z,y,x)顺序
 
-    def _save_slice_image(self, slice_img, patient_id, z_index):
-        # 使用pathlib处理路径
-        save_dir = Path(self.config.processed_dir) / "images"
-        save_dir.mkdir(exist_ok=True)
 
-        filename = f"{patient_id}_z{z_index}.png"
-        path = save_dir / filename
+    def process_nodule(self, ct_scan, annot, patient_id):
+        """处理单个结节"""
+        world_coord = np.array([annot['coordX'], annot['coordY'], annot['coordZ']])
+        voxel_coord = self._world_to_voxel(world_coord, ct_scan['origin'], ct_scan['spacing'])
+        print(f"转换后体素坐标: {voxel_coord}, CT数据形状: {ct_scan['data'].shape}")
 
-        # 验证图像数据
-        if slice_img.shape != (self.config.cube_size, self.config.cube_size):
-            raise ValueError(f"图像尺寸错误: {slice_img.shape}")
+        if not self._is_valid_coordinate(voxel_coord, ct_scan['data'].shape):
+            print(f"无效坐标跳过: {voxel_coord}")
+            return
 
-        # 保存前打印调试信息
-        print(f"保存图像到: {path.absolute()}")
-        print(f"图像数据范围: {slice_img.min()} - {slice_img.max()}")
+        cube = self._extract_cube(ct_scan['data'], voxel_coord)
 
-        cv2.imwrite(str(path), slice_img)
+        # 多尺度处理
+        for scale in range(len(self.config.grid_sizes)):
+            self._generate_scale_data(cube, annot, patient_id, scale)
 
-        # 验证文件确实存在
-        if not path.exists():
-            raise RuntimeError(f"文件保存失败: {path}")
-        return path
+    def _is_valid_coordinate(self, coord, data_shape):
+        """验证坐标有效性（data_shape应为z,y,x顺序）"""
+        # coord的维度顺序应为z,y,x
+        z, y, x = coord
+        return (0 <= z < data_shape[0]) and (0 <= y < data_shape[1]) and (0 <= x < data_shape[2])
+
+
+
+
 
 
 # YOLOv4模型集成
 class LunaYOLOv4(tf.keras.Model):
     def __init__(self, config):
         super().__init__()
+        # 显式定义输入层
+        self.input_layer = tf.keras.layers.Input(shape=(config.input_size, config.input_size, 3), name='input_image')
         self.backbone = CSPDarknet53()
         self.neck = PANet()
-        self.heads = [YOLOHead(512, 3, 5),
-                      YOLOHead(256, 3, 5),
-                      YOLOHead(128, 3, 5)]
+
+        # 修改后: 使用config中的num_classes参数
+        self.heads = [
+            YOLOHead(512, len(config.anchors[0]), config.num_classes),
+            YOLOHead(256, len(config.anchors[1]), config.num_classes),
+            YOLOHead(128, len(config.anchors[2]), config.num_classes)
+        ]
 
         # 多尺度训练配置
         self.grid_sizes = config.grid_sizes
         self.anchors = config.anchors
         self.output_names = ['large', 'medium', 'small']
 
-    def call(self, inputs):
+        self.loss_metrics = {
+            'total_loss': tf.keras.metrics.Mean(name='total_loss'),
+            'coord_loss': tf.keras.metrics.Mean(name='coord_loss'),
+            'conf_loss': tf.keras.metrics.Mean(name='conf_loss')
+        }
+        # 构建模型
+        self.build_model()
+
+    # def call(self, inputs):
+    #     # 前向传播
+    #     route_small, route_medium, route_large = self.backbone(inputs)
+    #     x_small, x_medium, x_large = self.neck((route_small, route_medium, route_large))
+    #
+    #     # 多尺度输出
+    #     outputs = [
+    #         self.heads[0](x_large),  # 大尺度检测
+    #         self.heads[1](x_medium),  # 中尺度检测
+    #         self.heads[2](x_small)  # 小尺度检测
+    #     ]
+    #     return outputs
+
+    def build_model(self):
+        """显式构建模型的计算图"""
         # 前向传播
-        route_small, route_medium, route_large = self.backbone(inputs)
+        x = self.input_layer
+        route_small, route_medium, route_large = self.backbone(x)
         x_small, x_medium, x_large = self.neck((route_small, route_medium, route_large))
 
         # 多尺度输出
         outputs = [
-            self.heads[0](x_large),  # 大尺度检测
-            self.heads[1](x_medium),  # 中尺度检测
-            self.heads[2](x_small)  # 小尺度检测
+            self.heads[0](x_large),  # shape: (batch, 13, 13, 3, 5)
+            self.heads[1](x_medium),  # shape: (batch, 26, 26, 3, 5)
+            self.heads[2](x_small)  # shape: (batch, 52, 52, 3, 5)
         ]
-        return outputs
+
+        # 创建Keras模型
+        self.keras_model = tf.keras.Model(inputs=self.input_layer, outputs=outputs)
+
+    def call(self, inputs, training=False):
+        """重写call方法以适配Keras训练流程"""
+        return self.keras_model(inputs, training=training)
 
 
-# 数据管道
-def create_dataset(config, batch_size=8):
-    def _parse_yolo_data(img_path):
-        # 读取图像
-        img = tf.io.read_file(img_path)
-        img = tf.image.decode_png(img, channels=1)
-        img = tf.image.resize(img, config.img_size)
 
-        # 生成标签路径（使用两次正则替换）
-        label_path = tf.strings.regex_replace(img_path, "images", "labels")
-        label_path = tf.strings.regex_replace(label_path, "\\.png$", ".txt")  # 精确匹配.png结尾
-
-        # 读取标注文件
-        label = tf.io.read_file(label_path)
-        parts = tf.strings.split(label)
-
-        # 转换为数值类型
-        return img / 255.0, (
-            tf.strings.to_number(parts[1:]),  # large层标签
-            tf.strings.to_number(parts[1:]),  # medium层标签
-            tf.strings.to_number(parts[1:])  # small层标签
-        )
-
-    # 创建数据集
-    img_files = tf.data.Dataset.list_files(f"{config.processed_dir}/images/*.png")
-    return img_files.map(_parse_yolo_data).batch(batch_size)
 
 
 # 使用示例
 if __name__ == "__main__":
     try:
-        config = LunaConfig()
         validate_annotations(config)  # 新增验证步骤
 
         preprocessor = LunaYoloPreprocessor(config)
@@ -372,5 +333,49 @@ if __name__ == "__main__":
     model = LunaYOLOv4(config)
     model.compile(optimizer='adam')
 
+    # 创建回调函数以保存模型
+    checkpoint_callback = ModelCheckpoint(
+        filepath=config.MODEL["model_save_path"],
+        save_weights_only=False,
+        save_best_only=True,
+        monitor='val_loss',
+        mode='min',
+        verbose=1
+    )
+
     # 开始训练
-    model.fit(train_dataset, epochs=50)
+    model.fit(train_dataset, epochs=15, callbacks=[checkpoint_callback])
+
+
+
+
+
+
+
+
+
+
+
+    # def _generate_yolo_label(self, img_shape, annot, img_path):
+    #     """生成YOLO标注文件（增加参数验证）"""
+    #     # 参数验证
+    #     if not Path(img_path).exists():
+    #         raise FileNotFoundError(f"图像文件不存在: {img_path}")
+    #
+    #     if img_shape[0] <= 0 or img_shape[1] <= 0:
+    #         raise ValueError(f"无效的图像尺寸: {img_shape}")
+    #
+    #     # 坐标转换（添加边界检查）
+    #     x_center = 0.5
+    #     y_center = 0.5
+    #     width = np.clip(annot['diameter_mm'] / (self.config.cube_size * self.config.spacing[0]), 0, 1)
+    #     height = np.clip(annot['diameter_mm'] / (self.config.cube_size * self.config.spacing[1]), 0, 1)
+    #     class_id = 1
+    #
+    #     # 构建标注内容
+    #     label_line = f"{scale} {x_center} {y_center} {width} {height} {class_id}\n"
+    #
+    #     # 保存标注
+    #     label_path = Path(img_path).parent.parent / "labels" / Path(img_path).name.replace(".png", ".txt")
+    #     label_path.write_text(label_line)
+    #     return label_path

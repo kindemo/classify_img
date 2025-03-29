@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import tensorflow as tf
-from src.yolo_mini import ANCHORS
+
 
 
 def decode_predictions(preds, anchors, num_classes, conf_threshold=0.5, iou_threshold=0.4):
