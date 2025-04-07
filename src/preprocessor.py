@@ -39,9 +39,14 @@ def create_dataset(config, batch_size):
     def _parse_yolo_data(img_path):
         # 读取图像和标签（此处需确保标签与图像路径一一对应）
         img = tf.io.read_file(img_path)
-        img = tf.image.decode_png(img, channels=3)
+        img = tf.image.decode_png(img, channels=1)
+
         img = tf.image.resize(img, (config.input_size, config.input_size))
+        # img = tf.expand_dims(img, axis=0)  # 添加batch维度
+
         img = img / 255.0  # 归一化
+        print(f"处理后的图像形状: {img.shape}")
+        # 应输出 (1, 416, 416, 1)
 
         # 生成标签路径
         label_path = tf.strings.regex_replace(img_path, "images", "labels")
@@ -54,6 +59,10 @@ def create_dataset(config, batch_size):
         def process_labels(content):
             content = content.numpy().decode('utf-8')
             lines = [line.strip() for line in content.split('\n') if line.strip()]
+
+            # 添加打印信息
+            print(f"解析标签文件内容:\n{content}")
+            print(f"共 {len(lines)} 行标签")
 
             # 初始化三个检测层的标签张量
             large_label = np.zeros((13, 13, 3, 6), dtype=np.float32)
@@ -91,11 +100,24 @@ def create_dataset(config, batch_size):
         large, medium, small = tf.py_function(
             process_labels, [label_content], [tf.float32, tf.float32, tf.float32]
         )
-        large.set_shape((13, 13, 3, 5))
-        medium.set_shape((26, 26, 3, 5))
-        small.set_shape((52, 52, 3, 5))
 
-        return img, (large, medium, small)
+        # large.set_shape((13, 13, 3, 6))
+        # medium.set_shape((26, 26, 3, 6))
+        # small.set_shape((52, 52, 3, 6))
+
+        # 添加形状验证
+        tf.debugging.assert_shapes([
+            (large, (13, 13, 3, 6)),
+            (medium, (26, 26, 3, 6)),
+            (small, (52, 52, 3, 6)),
+        ], message="标签形状错误")
+
+        # return img, (large, medium, small)
+        return img, {
+            "large": large,
+            "medium": medium,
+            "small": small
+        }  # 改为字典形式输出
 
     # 构建数据集（确保返回格式为 (images, (large_labels, medium_labels, small_labels))）
     img_files = tf.data.Dataset.list_files(f"{config.processed_dir}/images/*.png")
@@ -192,9 +214,11 @@ class LunaYoloPreprocessor():
                 'width': norm_w,
                 'height': norm_h
             }
+            # print(f"生成图像: {img_path}, 形状: {scaled_cube[z].shape}")
 
             # 生成标签
             self.label_generator.create_scale_label(img_path, slice_annot, scale)
+            # print(f"生成标签: {img_path.replace('images', 'labels').replace('.png', '.txt')}")
 
     @staticmethod
     def _world_to_voxel(world_coord, origin, spacing):
@@ -236,17 +260,14 @@ class LunaYoloPreprocessor():
 class LunaYOLOv4(tf.keras.Model):
     def __init__(self, config):
         super().__init__()
-        # 显式定义输入层
-        self.input_layer = tf.keras.layers.Input(shape=(config.input_size, config.input_size, 3), name='input_image')
+        # 子类化不需要显式定义输入层
         self.backbone = CSPDarknet53()
         self.neck = PANet()
 
-        # 修改后: 使用config中的num_classes参数
-        self.heads = [
-            YOLOHead(512, len(config.anchors[0]), config.num_classes),
-            YOLOHead(256, len(config.anchors[1]), config.num_classes),
-            YOLOHead(128, len(config.anchors[2]), config.num_classes)
-        ]
+        # 检测头
+        self.head_large = YOLOHead(512, len(config.anchors[0]), config.num_classes)
+        self.head_medium = YOLOHead(256, len(config.anchors[1]), config.num_classes)
+        self.head_small = YOLOHead(128, len(config.anchors[2]), config.num_classes)
 
         # 多尺度训练配置
         self.grid_sizes = config.grid_sizes
@@ -258,42 +279,23 @@ class LunaYOLOv4(tf.keras.Model):
             'coord_loss': tf.keras.metrics.Mean(name='coord_loss'),
             'conf_loss': tf.keras.metrics.Mean(name='conf_loss')
         }
-        # 构建模型
-        self.build_model()
-
-    # def call(self, inputs):
-    #     # 前向传播
-    #     route_small, route_medium, route_large = self.backbone(inputs)
-    #     x_small, x_medium, x_large = self.neck((route_small, route_medium, route_large))
-    #
-    #     # 多尺度输出
-    #     outputs = [
-    #         self.heads[0](x_large),  # 大尺度检测
-    #         self.heads[1](x_medium),  # 中尺度检测
-    #         self.heads[2](x_small)  # 小尺度检测
-    #     ]
-    #     return outputs
-
-    def build_model(self):
-        """显式构建模型的计算图"""
-        # 前向传播
-        x = self.input_layer
-        route_small, route_medium, route_large = self.backbone(x)
-        x_small, x_medium, x_large = self.neck((route_small, route_medium, route_large))
-
-        # 多尺度输出
-        outputs = [
-            self.heads[0](x_large),  # shape: (batch, 13, 13, 3, 5)
-            self.heads[1](x_medium),  # shape: (batch, 26, 26, 3, 5)
-            self.heads[2](x_small)  # shape: (batch, 52, 52, 3, 5)
-        ]
-
-        # 创建Keras模型
-        self.keras_model = tf.keras.Model(inputs=self.input_layer, outputs=outputs)
 
     def call(self, inputs, training=False):
-        """重写call方法以适配Keras训练流程"""
-        return self.keras_model(inputs, training=training)
+        # 主干网络前向传播
+        route_small, route_medium, route_large = self.backbone(inputs)
+
+        # 特征金字塔融合
+        x_small, x_medium, x_large = self.neck(
+            (route_small, route_medium, route_large)
+        )
+
+        # 多尺度预测输出
+        outputs = [
+            self.head_large(x_large),       # (batch, 13, 13, 3, 5+num_classes)
+            self.head_medium(x_medium),     # (batch, 26, 26, 3, 5+num_classes)
+            self.head_small(x_small)        # (batch, 52, 52, 3, 5+num_classes)
+        ]
+        return outputs
 
 
 
@@ -327,10 +329,11 @@ if __name__ == "__main__":
     #         print(f"最后处理的文件: {preprocessor.last_processed}")
 
     # 创建数据集
-    train_dataset = create_dataset(config)
+    train_dataset = create_dataset(config, 1)
 
     # 初始化模型
     model = LunaYOLOv4(config)
+    model.build((None, config.input_size, config.input_size, 1))  # 显式构建输入形状
     model.compile(optimizer='adam')
 
     # 创建回调函数以保存模型
@@ -346,36 +349,3 @@ if __name__ == "__main__":
     # 开始训练
     model.fit(train_dataset, epochs=15, callbacks=[checkpoint_callback])
 
-
-
-
-
-
-
-
-
-
-
-    # def _generate_yolo_label(self, img_shape, annot, img_path):
-    #     """生成YOLO标注文件（增加参数验证）"""
-    #     # 参数验证
-    #     if not Path(img_path).exists():
-    #         raise FileNotFoundError(f"图像文件不存在: {img_path}")
-    #
-    #     if img_shape[0] <= 0 or img_shape[1] <= 0:
-    #         raise ValueError(f"无效的图像尺寸: {img_shape}")
-    #
-    #     # 坐标转换（添加边界检查）
-    #     x_center = 0.5
-    #     y_center = 0.5
-    #     width = np.clip(annot['diameter_mm'] / (self.config.cube_size * self.config.spacing[0]), 0, 1)
-    #     height = np.clip(annot['diameter_mm'] / (self.config.cube_size * self.config.spacing[1]), 0, 1)
-    #     class_id = 1
-    #
-    #     # 构建标注内容
-    #     label_line = f"{scale} {x_center} {y_center} {width} {height} {class_id}\n"
-    #
-    #     # 保存标注
-    #     label_path = Path(img_path).parent.parent / "labels" / Path(img_path).name.replace(".png", ".txt")
-    #     label_path.write_text(label_line)
-    #     return label_path

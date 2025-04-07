@@ -3,7 +3,7 @@ from keras.applications.convnext import decode_predictions
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
 import tensorflow as tf
-from src.yolo_model import YOLOv4, YOLOv4Loss
+from src.yolo_model import YOLOv4
 
 
 def decode_predictions(preds, anchors, num_classes, conf_threshold=0.5, iou_threshold=0.4):

@@ -3,7 +3,7 @@ from config import config
 from preprocessor import *
 from model_train import YoloTrainer
 from src.YoloLabelGenerator import YOLOLabelGenerator
-from src.dataset import YoloDataset
+
 
 
 def load_mhd(mhd_path):
@@ -58,28 +58,32 @@ if __name__ == "__main__":
     #
 
 
-    preprocessor = LunaYoloPreprocessor(config)
-
-    # # 加载标注数据
-    annotations = pd.read_csv(config.annotation_csv)
-
-    # 处理每个CT文件
-    for mhd_path in glob.glob(f"{config.raw_data_dir}/*.mhd"):
-        # 加载CT数据
-        ct_scan = load_mhd(mhd_path)
-        patient_id = ct_scan['seriesuid']
-
-        # 获取对应标注
-        patient_annots = annotations[annotations['seriesuid'] == patient_id]
-
-        # 处理每个结节
-        for _, annot_row in patient_annots.iterrows():
-            preprocessor.process_nodule(ct_scan, annot_row.to_dict(), patient_id)
+    #
+    # preprocessor = LunaYoloPreprocessor(config)
+    #
+    # # # 加载标注数据
+    # annotations = pd.read_csv(config.annotation_csv)
+    #
+    # # 处理每个CT文件
+    # for mhd_path in glob.glob(f"{config.raw_data_dir}/*.mhd"):
+    #     # 加载CT数据
+    #     ct_scan = load_mhd(mhd_path)
+    #     patient_id = ct_scan['seriesuid']
+    #
+    #     # 获取对应标注
+    #     patient_annots = annotations[annotations['seriesuid'] == patient_id]
+    #
+    #     # 处理每个结节
+    #     for _, annot_row in patient_annots.iterrows():
+    #         preprocessor.process_nodule(ct_scan, annot_row.to_dict(), patient_id)
 
 
     # # 2. 加载数据集
-    dataset = YoloDataset(config)
-    train_data = dataset.load_dataset(config.PREPROCESS["output_dir"])
+    # dataset = YoloDataset(config)
+    # train_data = dataset.load_dataset(config.PREPROCESS["output_dir"])
+
+    train_data = create_dataset(config, 1)
+
 
 
 
