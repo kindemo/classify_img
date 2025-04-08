@@ -16,9 +16,9 @@ class YoloTrainer:
         )
 
         self.loss_fn  = {
-            'large': YoloLoss(config),  # large层损失
-            'medium': YoloLoss(config),  # medium层损失
-            'small': YoloLoss(config)  # small层损失
+            'large': YoloLoss( reduction="sum_over_batch_size"),  # large层损失
+            'medium': YoloLoss( reduction="sum_over_batch_size"),  # medium层损失
+            'small': YoloLoss(reduction="sum_over_batch_size")  # small层损失
         }
 
         # 创建回调函数以保存模型
@@ -33,7 +33,11 @@ class YoloTrainer:
 
     def train(self, train_dataset, val_dataset):
         self.model.compile(optimizer="adam",loss=self.loss_fn)
-        self.model.fit(train_dataset, callbacks=[self.checkpoint_callback], epochs=config.epoch, batch_size=config.batch_size)
+        self.model.fit(train_dataset,
+                       callbacks=[self.checkpoint_callback],
+                       validation_data=val_dataset,  # 添加验证数据
+                       epochs=config.epoch,
+                       batch_size=config.batch_size)
 
 
 
@@ -57,12 +61,14 @@ class YoloTrainer:
 #
 #     verify_model_structure()
 
-if __name__ == '__main__':
-    # 测试模型前向传播
-    model = LunaYOLOv4(config)
-    test_input = tf.random.normal((1, 416, 416, 1))  # 单通道输入
-    outputs = model(test_input)
-    print("Output Shapes:")
-    print(f"Large: {outputs[0].shape}")  # 应输出 (1,13,13,3,6)
-    print(f"Medium: {outputs[1].shape}")  # 应输出 (1,26,26,3,6)
-    print(f"Small: {outputs[2].shape}")  # 应输出 (1,52,52,3,6)
+
+
+# if __name__ == '__main__':
+#     # 测试模型前向传播
+#     model = LunaYOLOv4(config)
+#     test_input = tf.random.normal((1, 416, 416, 1))  # 单通道输入
+#     outputs = model(test_input)
+#     print("Output Shapes:")
+#     print(f"Large: {outputs[0].shape}")  # 应输出 (1,13,13,3,6)
+#     print(f"Medium: {outputs[1].shape}")  # 应输出 (1,26,26,3,6)
+#     print(f"Small: {outputs[2].shape}")  # 应输出 (1,52,52,3,6)

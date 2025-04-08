@@ -55,14 +55,9 @@ def create_dataset(config, batch_size):
         # 读取标签内容并解析为三个检测层的标签
         label_content = tf.io.read_file(label_path)
 
-        # 解析标签函数
         def process_labels(content):
             content = content.numpy().decode('utf-8')
             lines = [line.strip() for line in content.split('\n') if line.strip()]
-
-            # 添加打印信息
-            print(f"解析标签文件内容:\n{content}")
-            print(f"共 {len(lines)} 行标签")
 
             # 初始化三个检测层的标签张量
             large_label = np.zeros((13, 13, 3, 6), dtype=np.float32)
@@ -71,20 +66,19 @@ def create_dataset(config, batch_size):
 
             for line in lines:
                 parts = line.split()
-                if len(parts) != 9:
+                if len(parts) != 10:  # 确保每行10个字段
                     continue
 
                 scale = int(parts[0])
                 grid_x = int(parts[1])
                 grid_y = int(parts[2])
                 anchor_idx = int(parts[3])
-
                 tx = float(parts[4])
                 ty = float(parts[5])
                 tw = float(parts[6])
                 th = float(parts[7])
                 conf = float(parts[8])
-                class_id = int(parts[9])  # 新增分类解析
+                class_id = int(parts[9])
 
                 # 填充到对应检测层
                 if scale == 0 and grid_x < 13 and grid_y < 13 and anchor_idx < 3:

@@ -21,10 +21,10 @@ class Config:
         if not os.path.exists(self.annotation_csv):
             raise FileNotFoundError(f"标注文件不存在: {self.annotation_csv}")
 
-        self.epoch = 5
+        self.epoch = 1
         self.input_size = 416       # 单维度
         self.num_classes = 1
-        self.batch_size = 1
+        self.batch_size = 16
 
         self.spacing = (1.0, 1.0, 1.0)  # 添加空间间距参数
 
@@ -55,7 +55,7 @@ class Config:
             "input_shape": (416, 416, 1),
             "anchors": self.anchors,  # 使用之前定义的锚框
             "num_classes": 1,
-            "model_save_path": "./model",
+            "model_save_path": "D:\\PycharmProjects\\classify_img\\model",
         }
 
 

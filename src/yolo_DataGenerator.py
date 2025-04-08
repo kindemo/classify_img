@@ -75,19 +75,20 @@ class YoloDataGenerator(tf.keras.utils.Sequence):
         return np.array(batch_images) / 255.0, [l.astype(np.float32) for l in batch_labels]
 
     def _parse_label(self, label_path):
-        """解析YOLO格式标注文件"""
         boxes = []
         with open(label_path, 'r') as f:
             for line in f.readlines():
                 parts = line.strip().split()
-                if len(parts) < 5:
+                if len(parts) != 6:  # 必须严格检查6列
+                    print(f"无效标签行: {line}")
                     continue
-                class_id = int(parts[0])
-                x_center = float(parts[1])
-                y_center = float(parts[2])
-                width = float(parts[3])
-                height = float(parts[4])
-                boxes.append([x_center, y_center, width, height, class_id])
+                best_anchor = int(parts[0])
+                tx = float(parts[1])
+                ty = float(parts[2])
+                tw = float(parts[3])
+                th = float(parts[4])
+                class_id = int(parts[5])  # 正确获取class_id
+                boxes.append([best_anchor, tx, ty, tw, th, class_id])
         return np.array(boxes)
 
     def _preprocess_data(self, image, boxes):

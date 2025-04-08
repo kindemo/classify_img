@@ -12,15 +12,18 @@ class YOLOLabelGenerator:
         Path(config.label_dir).mkdir(parents=True, exist_ok=True)
 
     def generate_labels(self, excel_path):
-        """从Excel生成标签（适用于批量处理）"""
         df = pd.read_excel(excel_path)
-        required_columns = ['seriesuid', 'x_center', 'y_center', 'width', 'height']
+        required_columns = ['seriesuid', 'x_center', 'y_center', 'width', 'height']  # 移除z_index
         if not all(col in df.columns for col in required_columns):
             raise ValueError(f"Excel缺少必要列: {required_columns}")
 
         for _, row in df.iterrows():
+            # 生成标准2D文件名
             img_name = f"{row['seriesuid'].strip()}.png"
             img_path = os.path.join(self.config.image_dir, img_name)
+            if not os.path.exists(img_path):
+                print(f"警告：图片文件 {img_name} 不存在，跳过生成标签")
+                continue
             for scale in range(len(self.config.grid_sizes)):
                 self.create_scale_label(img_path, row, scale)
 
@@ -52,8 +55,8 @@ class YOLOLabelGenerator:
         tw = np.log(width / anchors[best_anchor][0] + 1e-8)
         th = np.log(height / anchors[best_anchor][1] + 1e-8)
 
-        # 构建标签行
-        label_line = f"{best_anchor} {tx:.4f} {ty:.4f} {tw:.4f} {th:.4f} {self.class_id}\n"
+        # 构建标签行（包含scale, grid_x, grid_y, anchor_idx, tx, ty, tw, th, conf=1, class_id）
+        label_line = f"{scale} {grid_x} {grid_y} {best_anchor} {tx:.4f} {ty:.4f} {tw:.4f} {th:.4f} 1 {self.class_id}\n"
 
         # 保存标签
         self._save_label(img_path, scale, label_line)
@@ -75,10 +78,13 @@ class YOLOLabelGenerator:
         return best_idx
 
     def _save_label(self, img_path, scale, label_line):
-        """保存标签文件"""
-        label_name = Path(img_path).name.replace(".png", f"_s{scale}.txt")
+        """保存标签文件，文件名与图像对应"""
+        seriesuid = Path(img_path).stem  # 获取不带扩展名的文件名
+        label_name = f"{seriesuid}.txt"  # 标签文件名与图像同名，扩展名为.txt
         label_path = os.path.join(self.config.label_dir, label_name)
-        with open(label_path, "a") as f:
+
+        # 覆盖写入模式
+        with open(label_path, "w", encoding="utf-8") as f:
             f.write(label_line)
 
 

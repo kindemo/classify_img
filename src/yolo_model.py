@@ -152,12 +152,42 @@ class YOLOHead(layers.Layer):
         return x
 
 
+# class YOLOv4(Model):
+#     def __init__(self, num_classes, anchors, input_size):
+#         super().__init__()
+#         self.input_layer = layers.Input(shape=(input_size, input_size, 1))  # 添加输入层
+#         self.num_classes = num_classes
+#         self.anchors = anchors
+#         self.input_size = input_size
+#
+#         self.backbone = CSPDarknet53()
+#         self.spp = SPP()
+#         self.panet = PANet()
+#
+#         # 调整检测头参数匹配特征图通道
+#         self.head_large = YOLOHead(512, len(anchors[0]), num_classes, name="large")  # 大尺度13x13
+#         self.head_medium = YOLOHead(256, len(anchors[1]), num_classes, name="medium")  # 中尺度26x26
+#         self.head_small = YOLOHead(128, len(anchors[2]), num_classes, name="small")  # 小尺度52x52
+#
+#
+#     def call(self, inputs):
+#         route_small, route_medium, route_large = self.backbone(inputs)
+#         x = self.spp(route_large)
+#         x_small, x_medium, x_large = self.panet((route_small, route_medium, x))
+#
+#         # 调整输出顺序为小->中->大
+#         return {
+#             "large": self.head_large(x_large),  # 13x13
+#             "medium": self.head_medium(x_medium),  # 26x26
+#             "small": self.head_small(x_small)  # 52x52
+#         }
+
+
 class YOLOv4(Model):
     def __init__(self, num_classes, anchors, input_size):
         super().__init__()
-        self.input_layer = layers.Input(shape=(input_size, input_size, 1))  # 添加输入层
         self.num_classes = num_classes
-        self.anchors = anchors
+        self.anchors = anchors  # 确保是Python列表
         self.input_size = input_size
 
         self.backbone = CSPDarknet53()
@@ -165,28 +195,42 @@ class YOLOv4(Model):
         self.panet = PANet()
 
         # 调整检测头参数匹配特征图通道
-        self.head_large = YOLOHead(512, len(anchors[0]), num_classes, name="large")  # 大尺度13x13
-        self.head_medium = YOLOHead(256, len(anchors[1]), num_classes, name="medium")  # 中尺度26x26
-        self.head_small = YOLOHead(128, len(anchors[2]), num_classes, name="small")  # 小尺度52x52
-
+        self.head_large = YOLOHead(512, len(anchors[0]), num_classes, name="large")
+        self.head_medium = YOLOHead(256, len(anchors[1]), num_classes, name="medium")
+        self.head_small = YOLOHead(128, len(anchors[2]), num_classes, name="small")
 
     def call(self, inputs):
         route_small, route_medium, route_large = self.backbone(inputs)
         x = self.spp(route_large)
         x_small, x_medium, x_large = self.panet((route_small, route_medium, x))
 
-        # 调整输出顺序为小->中->大
         return {
-            "large": self.head_large(x_large),  # 13x13
-            "medium": self.head_medium(x_medium),  # 26x26
-            "small": self.head_small(x_small)  # 52x52
+            "large": self.head_large(x_large),
+            "medium": self.head_medium(x_medium),
+            "small": self.head_small(x_small)
         }
+
+    # 新增序列化方法 =====================
+    def get_config(self):
+        # 返回构造参数
+        return {
+            "anchors": self.anchors,
+            "num_classes": self.num_classes,
+            "name": self.name
+        }
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 class YoloLoss(tf.keras.losses.Loss):
-    def __init__(self, config):
-        super().__init__()
+    def __init__(self,reduction="sum_over_batch_size",  # 新增父类参数处理
+                 name='yolo_loss'):
+        super().__init__(reduction=reduction, name=name)  # 关键：显式传递父类参数
+
         self.config = config
+        self.anchors = config.anchors
         self.num_classes = config.num_classes
 
     def call(self, y_true, y_pred):
@@ -223,4 +267,13 @@ class YoloLoss(tf.keras.losses.Loss):
         # 总损失（保持batch维度）
         total_loss = coord_loss + conf_loss + cls_loss
         return total_loss
+
+    def get_config(self):
+        # 包含父类参数
+        config = super().get_config()  # 获取父类配置
+        config.update({
+            "anchors": self.anchors,
+            "num_classes": self.num_classes
+        })
+        return config
 
