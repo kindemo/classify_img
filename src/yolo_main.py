@@ -50,7 +50,6 @@ if __name__ == "__main__":
     train_data = create_dataset(config, config.batch_size)
 
 
-
     # 3. 训练模型
     trainer = YoloTrainer(config)
     trainer.train(train_data, train_data)

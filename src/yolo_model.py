@@ -1,10 +1,5 @@
 import tensorflow as tf
 from tensorflow.keras import Model, layers, initializers
-import numpy as np
-import cv2
-
-from src.config import Config, config
-
 
 class ConvBNMish(layers.Layer):
     def __init__(self, filters, kernel_size, strides=1, use_bias=False):
@@ -205,9 +200,9 @@ class YOLOv4(Model):
         x_small, x_medium, x_large = self.panet((route_small, route_medium, x))
 
         return {
-            "large": self.head_large(x_large),
-            "medium": self.head_medium(x_medium),
-            "small": self.head_small(x_small)
+            "large": self.head_large(x_large),  # 13x13
+            "medium": self.head_medium(x_medium),  # 26x26
+            "small": self.head_small(x_small)  # 52x52
         }
 
     # 新增序列化方法 =====================
@@ -225,13 +220,11 @@ class YOLOv4(Model):
 
 
 class YoloLoss(tf.keras.losses.Loss):
-    def __init__(self,reduction="sum_over_batch_size",  # 新增父类参数处理
+    def __init__(self, anchors, num_classes, reduction="sum_over_batch_size",  # 新增父类参数处理
                  name='yolo_loss'):
         super().__init__(reduction=reduction, name=name)  # 关键：显式传递父类参数
-
-        self.config = config
-        self.anchors = config.anchors
-        self.num_classes = config.num_classes
+        self.anchors = anchors
+        self.num_classes = num_classes
 
     def call(self, y_true, y_pred):
         # 验证输入形状
