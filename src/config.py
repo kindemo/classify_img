@@ -21,7 +21,7 @@ class Config:
         if not os.path.exists(self.annotation_csv):
             raise FileNotFoundError(f"标注文件不存在: {self.annotation_csv}")
 
-        self.epoch = 1
+        self.epoch = 5
         self.input_size = 416       # 单维度
         self.num_classes = 1
         self.batch_size = 16
@@ -32,9 +32,9 @@ class Config:
         self.img_size = (416, 416)  # 输入图像尺寸
         self.grid_sizes = [52, 26, 13]  # YOLO特征图尺寸
         self.anchors = [
-            [(12, 16), (19, 36), (40, 28)],  # 小尺度
+            [(142, 110), (192, 243), (459, 401)],  # 大尺度
             [(36, 75), (76, 55), (72, 146)],  # 中尺度
-            [(142, 110), (192, 243), (459, 401)]  # 大尺度
+            [(12, 16), (19, 36), (40, 28)]  # 小尺度
         ]
 
         # 预处理参数
