@@ -23,33 +23,53 @@ def load_mhd(mhd_path):
 
 if __name__ == "__main__":
 
-    ## 1.数据预处理
-    # preprocessor = LunaYoloPreprocessor(config)
-    #
-    # # # 加载标注数据
-    # annotations = pd.read_csv(config.annotation_csv)
-    #
-    # # 处理每个CT文件
-    # for mhd_path in glob.glob(f"{config.raw_data_dir}/*.mhd"):
-    #     # 加载CT数据
-    #     ct_scan = load_mhd(mhd_path)
-    #     patient_id = ct_scan['seriesuid']
-    #
-    #     # 获取对应标注
-    #     patient_annots = annotations[annotations['seriesuid'] == patient_id]
-    #
-    #     # 处理每个结节
-    #     for _, annot_row in patient_annots.iterrows():
-    #         preprocessor.process_nodule(ct_scan, annot_row.to_dict(), patient_id)
+    # 处理全局肺结节
+    # preprocessor = FullSlicePreprocessor(config)
+    preprocessor = FocusSlicePreprocessor(config)
+    # 处理所有患者
+    df_annot = pd.read_csv(config.annotation_csv)
+    for mhd_path in glob.glob(f"{config.raw_data_dir}/*.mhd"):
+        patient_id = Path(mhd_path).stem
+        patient_annot = df_annot[df_annot['seriesuid'] == patient_id]
+        print(f'patient_id: {patient_id}')
 
+        # 跳过无标注的患者
+        if patient_annot.empty:
+            print(f"跳过无标注的患者: {patient_id}")
+            continue
 
-    # # 2. 加载数据集
-    # dataset = YoloDataset(config)
-    # train_data = dataset.load_dataset(config.PREPROCESS["output_dir"])
+        preprocessor.process_patient(mhd_path, patient_annot)
 
     train_data = create_dataset(config, config.batch_size)
-
 
     # 3. 训练模型
     trainer = YoloTrainer(config)
     trainer.train(train_data, train_data)
+
+
+
+
+
+# # 1.数据预处理(处理局部肺结节）
+# preprocessor = LunaYoloPreprocessor(config)
+#
+# # # 加载标注数据
+# annotations = pd.read_csv(config.annotation_csv)
+#
+# # 处理每个CT文件
+# for mhd_path in glob.glob(f"{config.raw_data_dir}/*.mhd"):
+#     # 加载CT数据
+#     ct_scan = load_mhd(mhd_path)
+#     patient_id = ct_scan['seriesuid']
+#
+#     # 获取对应标注
+#     patient_annots = annotations[annotations['seriesuid'] == patient_id]
+#
+#     # 处理每个结节
+#     for _, annot_row in patient_annots.iterrows():
+#         preprocessor.process_nodule(ct_scan, annot_row.to_dict(), patient_id)
+
+
+# # 2. 加载数据集
+# dataset = YoloDataset(config)
+# train_data = dataset.load_dataset(config.PREPROCESS["output_dir"])

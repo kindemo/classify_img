@@ -37,6 +37,10 @@ class Config:
             [(12, 16), (19, 36), (40, 28)]  # 小尺度
         ]
 
+        self.hu_window = (-1000, 400)
+        self.slice_thickness = 1.0
+        self.class_id = 1
+
         # 预处理参数
         self.target_spacing = 1.0  # 体素标准化间距(mm)
         self.cube_size = 32  # 截取立方体尺寸

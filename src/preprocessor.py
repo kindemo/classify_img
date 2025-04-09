@@ -2,7 +2,7 @@ import glob
 import os
 import math
 from pathlib import Path
-
+from src.config import config
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
@@ -18,105 +18,232 @@ from src.config import config
 from src.yolo_model import CSPDarknet53, PANet, YOLOHead
 
 
+def validate_dataset(config):
+    """完整的数据集验证"""
+    image_files = glob.glob(f"{config.image_dir}/*.png")
+    print(f"发现{len(image_files)}张图像")
 
-def validate_annotations(config):
-    df_annot = pd.read_csv(config.annotation_csv)
-    mhd_files = glob.glob(f"{config.raw_data_dir}/*.mhd")
+    missing_labels = 0
+    corrupted_files = 0
 
-    # 提取所有患者ID
-    patient_ids = [os.path.basename(f).replace(".mhd", "") for f in mhd_files]
+    for img_path in image_files:
+        # 转换标签路径
+        label_path = Path(img_path.replace("images", "labels")).with_suffix(".txt")
 
-    # 检查标注覆盖情况
-    missing = [pid for pid in patient_ids if pid not in df_annot['seriesuid'].values]
-    if missing:
-        print(f"警告: {len(missing)}个患者缺少标注数据，示例：{missing[:3]}")
-    else:
-        print("标注文件包含所有患者的标注数据")
+        # 检查标签文件存在性
+        if not label_path.exists():
+            print(f"缺失标签文件: {label_path}")
+            missing_labels += 1
+            continue
+
+        # 检查文件可读性
+        try:
+            with open(label_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # 验证内容格式
+                for line in content.splitlines():
+                    if not validate_label_line(line):
+                        print(f"无效标签行: {line} 在文件 {label_path}")
+                        corrupted_files += 1
+        except UnicodeDecodeError:
+            print(f"文件编码错误: {label_path}")
+            corrupted_files += 1
+        except Exception as e:
+            print(f"读取文件异常: {label_path}, 错误: {str(e)}")
+            corrupted_files += 1
+
+    print(f"验证完成，缺失标签: {missing_labels}，损坏文件: {corrupted_files}")
 
 
-# 输出格式 (images, (large_labels, medium_labels, small_labels))
+def validate_label_line(line):
+    parts = line.strip().split()
+    if len(parts) != 5:
+        return False
+    try:
+        class_id = int(parts[0])
+        x_center = float(parts[1])
+        y_center = float(parts[2])
+        width = float(parts[3])
+        height = float(parts[4])
+        if not (0 <= x_center <= 1 and 0 <= y_center <= 1):
+            return False
+        if width <= 0 or height <= 0:
+            return False
+    except ValueError:
+        return False
+    return True
+
+
 def create_dataset(config, batch_size):
+    """构建YOLOv4训练数据集，返回(image, (large_label, medium_label, small_label))格式"""
+
     def _parse_yolo_data(img_path):
-        # 读取图像和标签（此处需确保标签与图像路径一一对应）
+        """解析单样本：读取图像+处理标签"""
+        # 读取图像
         img = tf.io.read_file(img_path)
-        img = tf.image.decode_png(img, channels=1)
-
+        img = tf.image.decode_png(img, channels=1)  # 灰度图像单通道
         img = tf.image.resize(img, (config.input_size, config.input_size))
-        # img = tf.expand_dims(img, axis=0)  # 添加batch维度
-
-        img = img / 255.0  # 归一化
-        print(f"处理后的图像形状: {img.shape}")
-        # 应输出 (1, 416, 416, 1)
+        img = tf.cast(img, tf.float32) / 255.0  # 归一化到[0,1]
+        img.set_shape([config.input_size, config.input_size, 1])  # 显式设置形状
 
         # 生成标签路径
         label_path = tf.strings.regex_replace(img_path, "images", "labels")
-        label_path = tf.strings.regex_replace(label_path, "\\.png$", ".txt")
+        label_path = tf.strings.regex_replace(label_path, "\.png$", ".txt")
 
-        # 读取标签内容并解析为三个检测层的标签
+        # 解析标签内容
+        def _parse_label_content(content):
+            """将标签文本解析为三个检测层的张量（TensorFlow安全版本）"""
+            # 初始化空标签张量
+            large_label = tf.zeros((13, 13, 3, 6), dtype=tf.float32)
+            medium_label = tf.zeros((26, 26, 3, 6), dtype=tf.float32)
+            small_label = tf.zeros((52, 52, 3, 6), dtype=tf.float32)
+
+            # 处理空内容
+            content = tf.strings.strip(content)
+            is_empty = tf.equal(tf.strings.length(content), 0)
+
+            def process_non_empty():
+                lines = tf.strings.split(content, '\n')
+                line_count = tf.shape(lines)[0]
+
+                # 使用while_loop替代for循环
+                def process_lines(i, large, medium, small):
+                    line = tf.strings.strip(lines[i])
+
+                    # 跳过空行
+                    return tf.cond(
+                        tf.equal(tf.strings.length(line), 0),
+                        lambda: (i + 1, large, medium, small),
+                        lambda: process_valid_line(i, large, medium, small, line)
+                    )
+
+                def process_valid_line(i, large, medium, small, line):
+                    parts = tf.strings.split(line)
+
+                    # 验证字段数量
+                    return tf.cond(
+                        tf.not_equal(tf.shape(parts)[0], 10),
+                        lambda: (i + 1, large, medium, small),  # 跳过无效行
+                        lambda: parse_and_update(i, large, medium, small, parts)
+                    )
+
+                def parse_and_update(i, large, medium, small, parts):
+                    # 解析字段
+                    scale = tf.strings.to_number(parts[0], tf.int32)
+                    grid_x = tf.strings.to_number(parts[1], tf.int32)
+                    grid_y = tf.strings.to_number(parts[2], tf.int32)
+                    anchor_idx = tf.strings.to_number(parts[3], tf.int32)
+
+                    # 数值范围约束
+                    grid_x = tf.clip_by_value(grid_x, 0, 51)  # 最大支持small尺度52x52
+                    grid_y = tf.clip_by_value(grid_y, 0, 51)
+                    anchor_idx = tf.clip_by_value(anchor_idx, 0, 2)
+
+                    # 构建更新数据
+                    update = tf.stack([
+                        tf.strings.to_number(parts[4], tf.float32),
+                        tf.strings.to_number(parts[5], tf.float32),
+                        tf.strings.to_number(parts[6], tf.float32),
+                        tf.strings.to_number(parts[7], tf.float32),
+                        tf.strings.to_number(parts[8], tf.float32),
+                        tf.cast(tf.strings.to_number(parts[9], tf.int32), tf.float32)
+                    ])
+
+                    # 选择目标尺度
+                    target, grid_size = tf.switch_case(
+                        scale,
+                        [
+                            lambda: (large, 13),
+                            lambda: (medium, 26),
+                            lambda: (small, 52)
+                        ]
+                    )
+
+                    # 生成更新索引
+                    indices = tf.stack([
+                        tf.clip_by_value(grid_y, 0, grid_size - 1),
+                        tf.clip_by_value(grid_x, 0, grid_size - 1),
+                        tf.clip_by_value(anchor_idx, 0, 2)
+                    ])
+                    indices = tf.reshape(indices, [1, 3])  # 转换为二维索引
+
+                    # 执行张量更新
+                    updated_target = tf.tensor_scatter_nd_update(
+                        target,
+                        indices,
+                        tf.reshape(update, [1, 6])
+                    )
+
+                    # 返回更新后的张量
+                    return tf.switch_case(
+                        scale,
+                        [
+                            lambda: (i + 1, updated_target, medium, small),
+                            lambda: (i + 1, large, updated_target, small),
+                            lambda: (i + 1, large, medium, updated_target)
+                        ]
+                    )
+
+                # 执行循环处理
+                final_i, final_large, final_medium, final_small = tf.while_loop(
+                    cond=lambda i, *_: i < line_count,
+                    body=process_lines,
+                    loop_vars=(0, large_label, medium_label, small_label),
+                    shape_invariants=(
+                        tf.TensorShape([]),
+                        tf.TensorShape([13, 13, 3, 6]),
+                        tf.TensorShape([26, 26, 3, 6]),
+                        tf.TensorShape([52, 52, 3, 6])
+                    )
+                )
+
+                return final_large, final_medium, final_small
+
+            # 主条件判断
+            return tf.cond(
+                is_empty,
+                lambda: (large_label, medium_label, small_label),
+                process_non_empty
+            )
+
+        # 读取并处理标签
         label_content = tf.io.read_file(label_path)
-
-        def process_labels(content):
-            content = content.numpy().decode('utf-8')
-            lines = [line.strip() for line in content.split('\n') if line.strip()]
-
-            # 初始化三个检测层的标签张量
-            large_label = np.zeros((13, 13, 3, 6), dtype=np.float32)
-            medium_label = np.zeros((26, 26, 3, 6), dtype=np.float32)
-            small_label = np.zeros((52, 52, 3, 6), dtype=np.float32)
-
-            for line in lines:
-                parts = line.split()
-                if len(parts) != 10:  # 确保每行10个字段
-                    continue
-
-                scale = int(parts[0])
-                grid_x = int(parts[1])
-                grid_y = int(parts[2])
-                anchor_idx = int(parts[3])
-                tx = float(parts[4])
-                ty = float(parts[5])
-                tw = float(parts[6])
-                th = float(parts[7])
-                conf = float(parts[8])
-                class_id = int(parts[9])
-
-                # 填充到对应检测层
-                if scale == 0 and grid_x < 13 and grid_y < 13 and anchor_idx < 3:
-                    large_label[grid_y, grid_x, anchor_idx] = [tx, ty, tw, th, conf, class_id]
-                elif scale == 1 and grid_x < 26 and grid_y < 26 and anchor_idx < 3:
-                    medium_label[grid_y, grid_x, anchor_idx] = [tx, ty, tw, th, conf, class_id]
-                elif scale == 2 and grid_x < 52 and grid_y < 52 and anchor_idx < 3:
-                    small_label[grid_y, grid_x, anchor_idx] = [tx, ty, tw, th, conf, class_id]
-
-            return large_label, medium_label, small_label
-
-        # 调用处理函数并设置形状
         large, medium, small = tf.py_function(
-            process_labels, [label_content], [tf.float32, tf.float32, tf.float32]
+            _parse_label_content,
+            [label_content],
+            [tf.float32, tf.float32, tf.float32]
         )
 
-        # large.set_shape((13, 13, 3, 6))
-        # medium.set_shape((26, 26, 3, 6))
-        # small.set_shape((52, 52, 3, 6))
+        # 显式设置形状（使用tf.ensure_shape确保形状）
+        large = tf.ensure_shape(large, (13, 13, 3, 6))
+        medium = tf.ensure_shape(medium, (26, 26, 3, 6))
+        small = tf.ensure_shape(small, (52, 52, 3, 6))
 
-        # 添加形状验证
+        # 添加断言验证形状
         tf.debugging.assert_shapes([
             (large, (13, 13, 3, 6)),
             (medium, (26, 26, 3, 6)),
-            (small, (52, 52, 3, 6)),
-        ], message="标签形状错误")
+            (small, (52, 52, 3, 6))
+        ])
 
-        # return img, (large, medium, small)
         return img, {
             "large": large,
             "medium": medium,
             "small": small
-        }  # 改为字典形式输出
+        }  # 标签改为字典格式
 
-    # 构建数据集（确保返回格式为 (images, (large_labels, medium_labels, small_labels))）
-    img_files = tf.data.Dataset.list_files(f"{config.processed_dir}/images/*.png")
-    dataset = img_files.map(_parse_yolo_data, num_parallel_calls=tf.data.AUTOTUNE)
-    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    # 构建数据集管道
+    img_files = tf.data.Dataset.list_files(f"{config.image_dir}/*.png", shuffle=True)
+    dataset = img_files.map(
+        _parse_yolo_data,
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+
+    # 数据集优化
+    return dataset.prefetch(buffer_size=tf.data.AUTOTUNE) \
+        .batch(batch_size) \
+        .prefetch(tf.data.AUTOTUNE)
+
 
 
 
@@ -246,8 +373,182 @@ class LunaYoloPreprocessor():
         return (0 <= z < data_shape[0]) and (0 <= y < data_shape[1]) and (0 <= x < data_shape[2])
 
 
+# 关注所有切片
+class FullSlicePreprocessor:
+    def __init__(self, config):
+        self.config = config
+        self.slice_counter = 0
+        self.label_generator = YOLOLabelGenerator(config)
 
 
+        # 创建输出目录
+        self.image_dir = Path(config.processed_dir) / "images"
+        self.label_dir = Path(config.processed_dir) / "labels"
+        self.image_dir.mkdir(parents=True, exist_ok=True)
+        self.label_dir.mkdir(parents=True, exist_ok=True)
+        self.origin  = None
+        self.spacing = None  # 新增spacing属性
+
+    def process_patient(self, mhd_path, annotations):
+        """处理单个患者的全部CT切片"""
+        # 读取CT数据
+        ct_scan = sitk.ReadImage(mhd_path)
+        ct_array = sitk.GetArrayFromImage(ct_scan)  # shape: (num_slices, height, width)
+
+        origin = ct_scan.GetOrigin()
+        spacing = ct_scan.GetSpacing()
+
+        self.origin = origin  # 新增origin存储
+        self.spacing = spacing
+
+        # 遍历所有切片
+        for slice_idx in range(ct_array.shape[0]):
+            self.process_slice(
+                ct_slice=ct_array[slice_idx],
+                slice_z=origin[2] + slice_idx * spacing[2],  # 当前切片的Z轴坐标
+                spacing=spacing,
+                patient_id=Path(mhd_path).stem,
+                annotations=annotations,
+                slice_idx=slice_idx
+            )
+
+    def process_slice(self, ct_slice, slice_z, spacing, patient_id, annotations, slice_idx):
+        """处理单个切片"""
+        # 转换CT值为灰度图像
+        windowed = self.apply_window(ct_slice, self.config.hu_window)
+        png_img = ((windowed - windowed.min()) / (windowed.max() - windowed.min()) * 255).astype(np.uint8)
+
+        # 生成图像文件名
+        img_name = f"{patient_id}_slice{slice_idx:04d}.png"
+        img_path = self.image_dir / img_name
+
+        # 保存图像
+        cv2.imwrite(str(img_path), png_img)
+
+        # 生成对应标签
+        self.generate_labels(
+            img_path=img_path,
+            slice_z=slice_z,
+            annotations=annotations,
+            img_size=ct_slice.shape,
+            spacing=spacing
+        )
+
+    def apply_window(self, image, window):
+        """应用CT窗宽窗位"""
+        min_val = window[0] - window[1] / 2.0
+        max_val = window[0] + window[1] / 2.0
+        return np.clip(image, min_val, max_val)
+
+    def generate_labels(self, img_path, slice_z, annotations, img_size, spacing):
+        """生成YOLO格式标签文件（支持多尺度）"""
+        labels = []
+        img_w = img_size[1]  # 图像宽度（像素）
+        img_h = img_size[0]  # 图像高度（像素）
+
+        # 转换物理坐标系到像素坐标系
+        for _, annot in annotations.iterrows():
+            # 仅处理当前切片附近的标注
+            if abs(annot['coordZ'] - slice_z) > spacing[2] * self.config.slice_thickness:
+                continue
+
+
+            # 坐标转换
+            x_center_px = (annot['coordX'] - self.origin[0]) / spacing[0]
+            y_center_px = (annot['coordY'] - self.origin[1]) / spacing[1]
+            width_px = annot['diameter_mm'] / spacing[0]
+            height_px = annot['diameter_mm'] / spacing[1]
+
+            # 归一化处理
+            x_center = x_center_px / img_w
+            y_center = y_center_px / img_h
+            width = width_px / img_w
+            height = height_px / img_h
+
+            # 数值验证
+            if not (0 <= x_center <= 1 and 0 <= y_center <= 1):
+                print(f"坐标超出范围: {x_center}, {y_center}")
+                continue
+            if width <= 0 or height <= 0:
+                print(f"无效尺寸: {width}, {height}")
+                continue
+
+            labels.append([
+                self.config.class_id,
+                x_center,
+                y_center,
+                width,
+                height
+            ])
+
+
+        # 保存标签文件（强制UTF-8编码）
+        label_path = self.label_dir / f"{img_path.stem}.txt"
+        try:
+            if labels:
+                # 格式验证
+                assert all(len(item) == 5 for item in labels), "标签维度错误"
+                np.savetxt(
+                    str(label_path),
+                    labels,
+                    fmt="%d %.6f %.6f %.6f %.6f",
+                    header='',
+                    comments='',
+                    encoding='utf-8'
+                )
+            else:
+                # 创建空文件防止FileNotFoundError
+                label_path.write_text("", encoding='utf-8')
+        except Exception as e:
+            print(f"保存标签失败: {label_path}, 错误: {str(e)}")
+            raise
+
+
+# 只关注极少量切片
+class FocusSlicePreprocessor(FullSlicePreprocessor):
+    def process_patient(self, mhd_path, annotations):
+        """优化版：仅处理结节所在层及相邻切片"""
+        ct_scan = sitk.ReadImage(mhd_path)
+        ct_array = sitk.GetArrayFromImage(ct_scan)  # shape: (slices, height, width)
+        origin = ct_scan.GetOrigin()
+        spacing = ct_scan.GetSpacing()
+
+        # 获取所有结节所在的切片索引
+        target_slices = self._get_target_slices(annotations, origin, spacing, ct_array.shape[0])
+
+        # 仅处理目标切片
+        for slice_idx in target_slices:
+            self.process_slice(
+                ct_slice=ct_array[slice_idx],
+                slice_z=origin[2] + slice_idx * spacing[2],
+                spacing=spacing,
+                patient_id=Path(mhd_path).stem,
+                annotations=annotations,
+                slice_idx=slice_idx
+            )
+
+    def _get_target_slices(self, annotations, origin, spacing, total_slices):
+        """计算需要处理的切片索引"""
+        # 参数配置
+        around_slices = 2  # 每个结节前后各取2层
+        min_slice = 0
+        max_slice = total_slices - 1
+
+        target_indices = set()
+
+        # 遍历所有结节标注
+        for _, annot in annotations.iterrows():
+            # 世界坐标转体素坐标
+            world_coord = [annot['coordX'], annot['coordY'], annot['coordZ']]
+            voxel_z = (world_coord[2] - origin[2]) / spacing[2]
+            slice_idx = int(round(voxel_z))
+
+            # 添加目标切片及相邻层
+            start = max(slice_idx - around_slices, min_slice)
+            end = min(slice_idx + around_slices, max_slice)
+            target_indices.update(range(start, end + 1))
+
+        return sorted(target_indices)
 
 
 # YOLOv4模型集成
@@ -293,53 +594,22 @@ class LunaYOLOv4(tf.keras.Model):
 
 
 
-
-
-# 使用示例
+# 处理整体的CT
 if __name__ == "__main__":
-    try:
-        validate_annotations(config)  # 新增验证步骤
 
-        preprocessor = LunaYoloPreprocessor(config)
-
-        # 先加载标注文件
-        df_annotations = pd.read_csv(config.annotation_csv)
-        print(f"成功加载标注文件，共 {len(df_annotations)} 条记录")
-
-        # 处理每个CT文件
-        for mhd_file in glob.glob(f"{config.raw_data_dir}/*.mhd"):
-            preprocessor._process_patient(mhd_file, df_annotations)
-
-    except Exception as e:
-        print(f"初始化失败: {str(e)}")
-
-    # try:
-    #     preprocessor.process_dataset()
-    #     print(f"生成文件数: {preprocessor.file_counter}")
-    # except Exception as e:
-    #     print(f"预处理失败: {str(e)}")
-    #     # 打印最后处理的文件信息
-    #     if hasattr(preprocessor, 'last_processed'):
-    #         print(f"最后处理的文件: {preprocessor.last_processed}")
+    preprocessor = FullSlicePreprocessor(config)
+    # 处理所有患者
+    df_annot = pd.read_csv(config.annotation_csv)
+    for mhd_path in glob.glob(f"{config.raw_data_dir}/*.mhd"):
+        patient_id = Path(mhd_path).stem
+        patient_annot = df_annot[df_annot['seriesuid'] == patient_id]
+        print(f'patient_id: {patient_id}')
+        preprocessor.process_patient(mhd_path, patient_annot)
 
     # 创建数据集
-    train_dataset = create_dataset(config, 1)
+    dataset = create_dataset(config, batch_size=8)
 
-    # 初始化模型
+    # 模型训练（保持原有YOLO结构不变）
     model = LunaYOLOv4(config)
-    model.build((None, config.input_size, config.input_size, 1))  # 显式构建输入形状
-    model.compile(optimizer='adam')
-
-    # 创建回调函数以保存模型
-    checkpoint_callback = ModelCheckpoint(
-        filepath=config.MODEL["model_save_path"],
-        save_weights_only=False,
-        save_best_only=True,
-        monitor='val_loss',
-        mode='min',
-        verbose=1
-    )
-
-    # 开始训练
-    model.fit(train_dataset, epochs=15, callbacks=[checkpoint_callback])
+    model.fit(dataset, epochs=5)
 

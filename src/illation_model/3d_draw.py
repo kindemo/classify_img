@@ -146,6 +146,7 @@ class CTNoduleDetector:
         return np.expand_dims(resized, axis=(0, -1))  # 形状: (1,416,416,1)
 
     def _decode_predictions(self, preds, offset, spacing):
+
         """处理字典类型的模型输出"""
         # 按尺度顺序处理输出：large(13x13), medium(26x26), small(52x52)
         output_keys = ['large', 'medium', 'small']
@@ -189,10 +190,17 @@ class CTNoduleDetector:
                         bh = np.exp(pred[i, j, a, 3]) * anchors[a][1]
 
                         # 转换为实际坐标（输入图像尺度）
-                        x_center = bx * self.config['input_size'] + x_start
+                        # 坐标转换时加入缩放
+                        # 计算窗口实际尺寸与模型输入的比例
+                        window_size = 256  # 滑动窗口原始尺寸
+                        scale_ratio = window_size / self.config['input_size']
+                        x_center_in_window = bx * self.config['input_size']  # 模型输入尺度坐标
+                        x_center = x_start + x_center_in_window * scale_ratio  # 缩放回原始窗口
+
+                        # x_center = bx * self.config['input_size'] + x_start
                         y_center = by * self.config['input_size'] + y_start
-                        width = bw * self.config['input_size']
-                        height = bh * self.config['input_size']
+                        width = bw * self.config['input_size'] * scale_ratio * spacing[2]  # 最终物理尺寸
+                        height = bh * self.config['input_size'] * scale_ratio * spacing[1]
 
                         # 转换到世界坐标系（毫米）
                         world_coord = voxel_to_world(
@@ -245,63 +253,44 @@ class CTNoduleDetector:
         return keep
 
     def _visualize(self, ct_array, results, target_z=91):
-        """生成与示例图像完全一致的可视化"""
-        # 创建画布
         plt.figure(figsize=(16, 12))
         ax = plt.gca()
 
-        # 验证切片有效性
-        if target_z >= ct_array.shape[0]:
-            print(f"警告：target_z={target_z} 超出CT数据范围（总切片数：{ct_array.shape[0]}）")
-            return
+        # 逆归一化获取原始HU值
+        slice_data = ct_array[target_z] * 1400 - 1000
+        print("slice_data范围:", np.min(slice_data), np.max(slice_data))
 
-        # 显示目标切片（注意转置坐标系统）
-        # 获取原始HU值（撤销归一化）
-        slice_data = ct_array[target_z] * 1400 - 1000  # 逆变换
-
-        # 显示时转置并使用肺窗参数
-        ax.imshow(slice_data.T,
-                  cmap='gray',
-                  vmin=-1000,
-                  vmax=400)  # 标准肺窗设置
-
+        plt.imshow(slice_data.T, cmap='gray', vmin=-1000, vmax=400)
         ax.set_title(f"Axial Slice Z={target_z}", fontsize=14, color='white', pad=20)
         ax.axis('off')
 
-        # 标注参数设置
-        box_style = {
-            'linewidth': 2,
-            'edgecolor': self.colors['nodule'],
-            'facecolor': 'none'
-        }
-        text_style = {
-            'color': self.colors['nodule'],
-            'fontsize': 12,
-            'bbox': {'facecolor': 'black', 'alpha': 0.7, 'pad': 2, 'edgecolor': 'none'}
-        }
-
-        # 绘制检测框（转换坐标到显示坐标系）
-        valid_boxes = list(filter(lambda x: x['z'] == target_z, results))
+        # 筛选当前切片的检测结果
+        valid_boxes = [b for b in results if b['z'] == target_z]
         print(f"在切片Z={target_z}发现{len(valid_boxes)}个结节")
 
         for box in valid_boxes:
-            # 转换为图像坐标系（X,Y互换）
-            x1 = box['y'] - box['height'] / 2  # 原y坐标对应显示X轴
-            y1 = box['x'] - box['width'] / 2  # 原x坐标对应显示Y轴
-            width = box['height']  # 高度对应显示宽度
-            height = box['width']  # 宽度对应显示高度
+            # 转换到显示坐标系 (X <-> Y交换)
+            x_center = box['x']
+            y_center = box['y']
+            width = box['width']
+            height = box['height']
 
-            # 绘制矩形
-            rect = Rectangle((x1, y1), width, height,  ** box_style)
+            x1 = y_center - height / 2
+            y1 = x_center - width / 2
+            display_width = height
+            display_height = width
+
+            rect = Rectangle((x1, y1), display_width, display_height,
+                             linewidth=2, edgecolor='#00FF00', facecolor='none')
             ax.add_patch(rect)
 
-            # 添加置信度文本（调整显示位置）
-            text = f"{min(box['confidence'], 0.99):.2f}"  # 示例图显示不超过0.99
-            ax.text(x1 + 5, y1 + 15, text,  ** text_style)
+            # 添加置信度文本
+            text = f"{min(box['confidence'], 0.99):.2f}"
+            plt.text(x1 + 5, y1 + 15, text, color='#00FF00', fontsize=12,
+                     bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
 
-            # 统一显示（关键修正！）
-            plt.tight_layout()
-            plt.show()
+        plt.tight_layout()
+        plt.show()
 
 
 # -------------------- 使用示例 --------------------
