@@ -3,6 +3,7 @@ from config import config
 from preprocessor import *
 from model_train import YoloTrainer
 from src.YoloLabelGenerator import YOLOLabelGenerator
+from src.dataset import create_dataset
 
 
 
@@ -25,21 +26,22 @@ if __name__ == "__main__":
 
     # 处理全局肺结节
     # preprocessor = FullSlicePreprocessor(config)
-    preprocessor = FocusSlicePreprocessor(config)
-    # 处理所有患者
-    df_annot = pd.read_csv(config.annotation_csv)
-    for mhd_path in glob.glob(f"{config.raw_data_dir}/*.mhd"):
-        patient_id = Path(mhd_path).stem
-        patient_annot = df_annot[df_annot['seriesuid'] == patient_id]
-        print(f'patient_id: {patient_id}')
 
-        # 跳过无标注的患者
-        if patient_annot.empty:
-            print(f"跳过无标注的患者: {patient_id}")
-            continue
-
-        preprocessor.process_patient(mhd_path, patient_annot)
-
+    # # 处理感兴趣的切片
+    # preprocessor = FocusSlicePreprocessor(config)
+    # # 处理所有患者
+    # df_annot = pd.read_csv(config.annotation_csv)
+    # for mhd_path in glob.glob(f"{config.raw_data_dir}/*.mhd"):
+    #     patient_id = Path(mhd_path).stem
+    #     patient_annot = df_annot[df_annot['seriesuid'] == patient_id]
+    #     print(f'patient_id: {patient_id}')
+    #
+    #     # 跳过无标注的患者
+    #     if patient_annot.empty:
+    #         print(f"跳过无标注的患者: {patient_id}")
+    #         continue
+    #
+    #     preprocessor.process_patient(mhd_path, patient_annot)
     train_data = create_dataset(config, config.batch_size)
 
     # 3. 训练模型

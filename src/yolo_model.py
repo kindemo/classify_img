@@ -177,7 +177,7 @@ class YOLOHead(layers.Layer):
 #             "small": self.head_small(x_small)  # 52x52
 #         }
 
-
+# 模型集成（字典方式返回）
 class YOLOv4(Model):
     def __init__(self, num_classes, anchors, input_size):
         super().__init__()
@@ -217,6 +217,7 @@ class YOLOv4(Model):
     @classmethod
     def from_config(cls, config):
         return cls(**config)
+
 
 
 class YoloLoss(tf.keras.losses.Loss):
@@ -270,3 +271,44 @@ class YoloLoss(tf.keras.losses.Loss):
         })
         return config
 
+
+# YOLOv4模型集成(列表方式返回）
+# class LunaYOLOv4(tf.keras.Model):
+#     def __init__(self, config):
+#         super().__init__()
+#         # 子类化不需要显式定义输入层
+#         self.backbone = CSPDarknet53()
+#         self.neck = PANet()
+#
+#         # 检测头
+#         self.head_large = YOLOHead(512, len(config.anchors[0]), config.num_classes)
+#         self.head_medium = YOLOHead(256, len(config.anchors[1]), config.num_classes)
+#         self.head_small = YOLOHead(128, len(config.anchors[2]), config.num_classes)
+#
+#         # 多尺度训练配置
+#         self.grid_sizes = config.grid_sizes
+#         self.anchors = config.anchors
+#         self.output_names = ['large', 'medium', 'small']
+#
+#         self.loss_metrics = {
+#             'total_loss': tf.keras.metrics.Mean(name='total_loss'),
+#             'coord_loss': tf.keras.metrics.Mean(name='coord_loss'),
+#             'conf_loss': tf.keras.metrics.Mean(name='conf_loss')
+#         }
+#
+#     def call(self, inputs, training=False):
+#         # 主干网络前向传播
+#         route_small, route_medium, route_large = self.backbone(inputs)
+#
+#         # 特征金字塔融合
+#         x_small, x_medium, x_large = self.neck(
+#             (route_small, route_medium, route_large)
+#         )
+#
+#         # 多尺度预测输出
+#         outputs = [
+#             self.head_large(x_large),       # (batch, 13, 13, 3, 5+num_classes)
+#             self.head_medium(x_medium),     # (batch, 26, 26, 3, 5+num_classes)
+#             self.head_small(x_small)        # (batch, 52, 52, 3, 5+num_classes)
+#         ]
+#         return outputs

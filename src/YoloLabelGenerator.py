@@ -8,7 +8,7 @@ from src.config import config
 class YOLOLabelGenerator:
     def __init__(self, config):
         self.config = config
-        self.class_id = 1  # 结节类别ID
+        self.class_id = 1   # 代表结节类别ID
         Path(config.label_dir).mkdir(parents=True, exist_ok=True)
 
     def generate_labels(self, excel_path):
@@ -28,38 +28,18 @@ class YOLOLabelGenerator:
                 self.create_scale_label(img_path, row, scale)
 
     def create_scale_label(self, img_path, annot, scale):
-        """生成单个尺度的标签文件"""
-        grid_size = self.config.grid_sizes[scale]
-        anchors = self.config.anchors[scale]
-
+        """生成符合YOLO标准的标签"""
         x_center = annot['x_center']
         y_center = annot['y_center']
         width = annot['width']
         height = annot['height']
 
-        # 验证坐标范围
-        if not (0 <= x_center <= 1 and 0 <= y_center <= 1):
-            print(f"警告：异常坐标值 {x_center}, {y_center}")
-            return
+        label_line = f"{self.class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n"
 
-        # 计算网格位置和偏移
-        grid_x = int(x_center * grid_size)
-        grid_y = int(y_center * grid_size)
-        tx = x_center * grid_size - grid_x
-        ty = y_center * grid_size - grid_y
-
-        # 匹配最佳锚框
-        best_anchor = self._find_best_anchor(width, height, anchors)
-
-        # 计算尺寸参数
-        tw = np.log(width / anchors[best_anchor][0] + 1e-8)
-        th = np.log(height / anchors[best_anchor][1] + 1e-8)
-
-        # 构建标签行（包含scale, grid_x, grid_y, anchor_idx, tx, ty, tw, th, conf=1, class_id）
-        label_line = f"{scale} {grid_x} {grid_y} {best_anchor} {tx:.4f} {ty:.4f} {tw:.4f} {th:.4f} 1 {self.class_id}\n"
-
-        # 保存标签
-        self._save_label(img_path, scale, label_line)
+        # 保存标签（所有尺度共享同一个标签文件）
+        label_path = Path(img_path).with_suffix('.txt')
+        with open(label_path, "a") as f:
+            f.write(label_line)
 
     @staticmethod
     def _find_best_anchor(width, height, anchors):

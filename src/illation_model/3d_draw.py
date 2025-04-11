@@ -1,5 +1,8 @@
+import os
+
 import SimpleITK as sitk
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
@@ -81,31 +84,99 @@ class CTNoduleDetector:
 
         return array, ct_image.GetOrigin(), ct_image.GetSpacing()
 
+    import pandas as pd
+    import os
+
+    def _load_annotations(self, mhd_path):
+        """加载对应CT的真实结节标注"""
+        # 示例标注文件路径（根据实际情况调整）
+        annotation_file = config.annotation_csv
+
+        if not os.path.exists(annotation_file):
+            return []
+
+        # 提取seriesuid
+        seriesuid = os.path.basename(mhd_path).split('.mhd')[0]
+
+        # 读取CSV文件
+        df = pd.read_csv(annotation_file)
+        nodules = df[df['seriesuid'] == seriesuid]
+
+        true_annotations = []
+        for _, row in nodules.iterrows():
+            true_annotations.append({
+                'x': row['coordX'],
+                'y': row['coordY'],
+                'z': row['coordZ'],
+                'diameter': row['diameter_mm']
+            })
+        return true_annotations
+
+    def _get_annotated_z_levels(self, annotations, origin, spacing, total_slices):
+        """从标注中解析需要处理的z层"""
+        target_zs = []
+        for ann in annotations:
+            # 世界坐标转体素坐标
+            voxel_z = (ann['z'] - origin[2]) / spacing[2]
+            z_index = int(round(voxel_z))
+
+            # 有效性检查
+            if 0 <= z_index < total_slices:
+                target_zs.append(z_index)
+
+        # 去重并排序
+        return sorted(list(set(target_zs)))
+
     def detect_ct(self, mhd_path):
         """完整检测流程"""
         # 1. 加载CT数据
         ct_array, origin, spacing = self._load_ct(mhd_path)
 
-        # 2. 遍历所有轴向切片
+        # 2. 加载真实结节标注
+        true_annotations = self._load_annotations(mhd_path)
+
+        # # 3. 遍历所有轴向切片
+        # all_results = []
+        # for z in range(ct_array.shape[0]):
+        #     slice_data = ct_array[z]
+        #
+        #     # 3. 滑动窗口检测
+        #     detections = self._detect_slice(slice_data, z, spacing)
+        #
+        #     # 4. 合并当前切片结果
+        #     all_results.extend(detections)
+
+        # 3. 计算需要处理的z层
+        target_zs = self._get_annotated_z_levels(true_annotations, origin, spacing, ct_array.shape[0])
+        if not target_zs:
+            print("未找到标注层，跳过检测")
+            return []
+
+        # 4. 仅遍历标注层切片
         all_results = []
-        for z in range(ct_array.shape[0]):
+        for z in target_zs:
             slice_data = ct_array[z]
-
-            # 3. 滑动窗口检测
-            detections = self._detect_slice(slice_data, z, spacing)
-
-            # 4. 合并当前切片结果
+            detections = self._detect_slice(slice_data, z, spacing, origin)
             all_results.extend(detections)
 
         # 5. 全局NMS
         final_results = self._nms(all_results)
 
-        # 6. 可视化关键切片
-        self._visualize(ct_array, final_results, target_z=91)
+        # 在NMS后强制将框调整为正方形
+        for box in final_results:
+            max_size = max(box['width'], box['height'])
+            box['width'] = max_size
+            box['height'] = max_size
+
+        # 6. 可视化（传递真实标注和坐标信息）
+        # self._visualize(ct_array, final_results, true_annotations, origin, spacing, target_z=91)
+        for i in range(len(target_zs)):
+            self._visualize(ct_array, final_results, true_annotations, origin, spacing,
+                            target_z=target_zs[i])
 
         return final_results
 
-    def _detect_slice(self, slice_data, z_index, spacing, window_size=416, stride=256):
+    def _detect_slice(self, slice_data, z_index, spacing, origin, window_size=416, stride=208):
         """处理单个轴向切片"""
         detections = []
         h, w = slice_data.shape
@@ -123,7 +194,7 @@ class CTNoduleDetector:
                 preds = self.model.predict(processed)
 
                 # 解码预测结果
-                boxes = self._decode_predictions(preds, (z_index, y, x), spacing)
+                boxes = self._decode_predictions(preds, (z_index, y, x), spacing, origin)
 
                 detections.extend(boxes)
 
@@ -145,29 +216,34 @@ class CTNoduleDetector:
         resized = cv2.resize(window, (self.config['input_size'], self.config['input_size']))
         return np.expand_dims(resized, axis=(0, -1))  # 形状: (1,416,416,1)
 
-    def _decode_predictions(self, preds, offset, spacing):
-
-        """处理字典类型的模型输出"""
+    def _decode_predictions(self, preds, offset, spacing, origin):
+        """修正后的预测解码逻辑"""
         # 按尺度顺序处理输出：large(13x13), medium(26x26), small(52x52)
         output_keys = ['large', 'medium', 'small']
 
         boxes = []
-        z, y_start, x_start = offset
+        z_index, y_start, x_start = offset  # 当前窗口的起始坐标（体素单位）
         num_classes = len(self.config['class_names'])
+        input_size = self.config['input_size']  # 模型输入尺寸，如416
+        window_size = 256  # 滑动窗口的原始尺寸
+
+        # 计算每个网格单元的实际像素大小
+        scale_ratio = window_size / input_size
 
         for scale_idx, output_key in enumerate(output_keys):
             if output_key not in preds:
                 continue
 
-            # 获取当前尺度参数
             pred = preds[output_key][0]  # 取第一个batch
-            grid_size = pred.shape[1]  # 特征图实际尺寸
+            grid_size = pred.shape[1]  # 特征图尺寸（如13,26,52）
             anchors = self.config['anchors'][scale_idx]
-            print(f"grid_size: {grid_size}, pred_shape: {pred.shape}")
 
             # 调整预测张量形状 (grid, grid, 3, 5+classes)
             if pred.shape[-1] == 3 * (5 + num_classes):
                 pred = pred.reshape((grid_size, grid_size, 3, 5 + num_classes))
+
+            # 计算每个网格单元对应的实际像素数
+            cell_size = window_size / grid_size
 
             # 遍历网格单元和锚框
             for i in range(grid_size):
@@ -175,51 +251,52 @@ class CTNoduleDetector:
                     for a in range(3):
                         # 解析置信度
                         conf = sigmoid(pred[i, j, a, 4])
-                        print(f"conf: {conf}")
-                        if conf < 0.5:
+                        if conf < 0.50:  # 过滤低置信度
                             continue
 
-                        # 解析相对坐标
+                        # 关键修改点1：正确计算中心坐标
                         tx = sigmoid(pred[i, j, a, 0])
                         ty = sigmoid(pred[i, j, a, 1])
-                        bx = (tx + j) / grid_size  # 网格内偏移
-                        by = (ty + i) / grid_size
 
-                        # 计算绝对尺寸
-                        bw = np.exp(pred[i, j, a, 2]) * anchors[a][0]
-                        bh = np.exp(pred[i, j, a, 3]) * anchors[a][1]
+                        # 计算相对于窗口的坐标（像素单位）
+                        x_center_window = (j + tx) * cell_size
+                        y_center_window = (i + ty) * cell_size
 
-                        # 转换为实际坐标（输入图像尺度）
-                        # 坐标转换时加入缩放
-                        # 计算窗口实际尺寸与模型输入的比例
-                        window_size = 256  # 滑动窗口原始尺寸
-                        scale_ratio = window_size / self.config['input_size']
-                        x_center_in_window = bx * self.config['input_size']  # 模型输入尺度坐标
-                        x_center = x_start + x_center_in_window * scale_ratio  # 缩放回原始窗口
+                        # 转换为整个CT切片的坐标（加上窗口起始位置）
+                        x_center = x_start + x_center_window
+                        y_center = y_start + y_center_window
 
-                        # x_center = bx * self.config['input_size'] + x_start
-                        y_center = by * self.config['input_size'] + y_start
-                        width = bw * self.config['input_size'] * scale_ratio * spacing[2]  # 最终物理尺寸
-                        height = bh * self.config['input_size'] * scale_ratio * spacing[1]
+                        # 关键修改点2：正确计算宽高（毫米单位）
+                        bw = np.exp(pred[i, j, a, 2]) * anchors[a][0] / input_size
+                        bh = np.exp(pred[i, j, a, 3]) * anchors[a][1] / input_size
 
-                        # 转换到世界坐标系（毫米）
+                        width = bw * window_size * spacing[0]  # 转换为毫米
+                        height = bh * window_size * spacing[1]
+
+                        # 转换为世界坐标（毫米）
                         world_coord = voxel_to_world(
-                            (z, y_center, x_center),  # 注意CT坐标顺序(Z,Y,X)
-                            origin=(0, 0, 0),  # 根据实际原点调整
+                            (z_index, y_center, x_center),
+                            origin=origin,
                             spacing=spacing
                         )
 
+                        # 调试输出
+                        print(
+                            f"预测框: conf={conf:.2f}, 坐标(z,y,x)=({z_index}, {y_center}, {x_center}), "
+                            f"尺寸={width:.1f}x{height:.1f} mm, 世界坐标: {world_coord}"
+                        )
+
                         boxes.append({
-                            'z': z,
-                            'y': y_center,
-                            'x': x_center,
-                            'width': width * spacing[2],  # X方向间距
-                            'height': height * spacing[1],  # Y方向间距
+                            'z': world_coord[2],  # 世界坐标Z (mm)
+                            'y': world_coord[1],  # Y (mm)
+                            'x': world_coord[0],  # X (mm)
+                            'width': width,
+                            'height': height,
                             'confidence': conf
                         })
         return boxes
 
-    def _nms(self, detections, iou_threshold=0.4):
+    def _nms(self, detections, iou_threshold=0.8):
         """二维非极大值抑制"""
         # 按z轴分组处理
         z_groups = {}
@@ -252,41 +329,69 @@ class CTNoduleDetector:
 
         return keep
 
-    def _visualize(self, ct_array, results, target_z=91):
+    def _visualize(self, ct_array, results, true_annotations, origin, spacing, target_z=91):
+        """修正后的可视化方法"""
+        if target_z >= ct_array.shape[0]:
+            print(f"警告：目标层{target_z}超出CT范围")
+            return
+
+
         plt.figure(figsize=(16, 12))
         ax = plt.gca()
 
         # 逆归一化获取原始HU值
         slice_data = ct_array[target_z] * 1400 - 1000
-        print("slice_data范围:", np.min(slice_data), np.max(slice_data))
-
         plt.imshow(slice_data.T, cmap='gray', vmin=-1000, vmax=400)
-        ax.set_title(f"Axial Slice Z={target_z}", fontsize=14, color='white', pad=20)
+        ax.set_title(f"Axial Slice Z={target_z}\nGreen: Predicted | Red: Ground Truth",
+                     fontsize=14, color='white', pad=20)
         ax.axis('off')
 
-        # 筛选当前切片的检测结果
-        valid_boxes = [b for b in results if b['z'] == target_z]
-        print(f"在切片Z={target_z}发现{len(valid_boxes)}个结节")
+        # 处理真实标注
+        true_boxes = []
+        for ann in true_annotations:
+            voxel_z = (ann['z'] - origin[2]) / spacing[2]
+            z_index = int(round(voxel_z))
 
-        for box in valid_boxes:
-            # 转换到显示坐标系 (X <-> Y交换)
-            x_center = box['x']
-            y_center = box['y']
-            width = box['width']
-            height = box['height']
 
-            x1 = y_center - height / 2
-            y1 = x_center - width / 2
-            display_width = height
-            display_height = width
+            if z_index == target_z:
+                # 转换为像素坐标
+                voxel_x = (ann['x'] - origin[0]) / spacing[0]
+                voxel_y = (ann['y'] - origin[1]) / spacing[1]
+                diameter_pixels = ann['diameter'] / spacing[0]  # 假设各向同性
 
-            rect = Rectangle((x1, y1), display_width, display_height,
-                             linewidth=2, edgecolor='#00FF00', facecolor='none')
+                # 绘制红色框
+                rect = Rectangle(
+                    (voxel_x - diameter_pixels / 2, voxel_y - diameter_pixels / 2),
+                    diameter_pixels, diameter_pixels,
+                    linewidth=2, edgecolor='red', facecolor='none'
+                )
+                ax.add_patch(rect)
+                plt.text(voxel_x + 5, voxel_y + 15, 'True',
+                         color='red', fontsize=12,
+                         bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
+            print(f"当前可视化层: {target_z}, 预测框层: {z_index}")
+
+        # 处理预测结果
+        for box in results:
+            # 关键修改点3：世界坐标转像素坐标
+            voxel_z = (box['z'] - origin[2]) / spacing[2]
+            if abs(voxel_z - target_z) > 0.5:  # 检查是否在当前层
+                continue
+            # 转换到像素坐标
+            voxel_x = (box['x'] - origin[0]) / spacing[0]
+            voxel_y = (box['y'] - origin[1]) / spacing[1]
+            size_pixels = box['width'] / spacing[0]  # 转换为像素尺寸
+
+            # 绘制绿色框
+            # print(f"预测框显示坐标: x={voxel_x}, y={voxel_y}, size={size_pixels}")
+            rect = Rectangle(
+                (voxel_x - size_pixels / 2, voxel_y - size_pixels / 2),
+                size_pixels, size_pixels,
+                linewidth=2, edgecolor='#00FF00', facecolor='none'
+            )
             ax.add_patch(rect)
-
-            # 添加置信度文本
-            text = f"{min(box['confidence'], 0.99):.2f}"
-            plt.text(x1 + 5, y1 + 15, text, color='#00FF00', fontsize=12,
+            plt.text(voxel_x + 5, voxel_y + 15, f"{box['confidence']:.2f}",
+                     color='#00FF00', fontsize=12,
                      bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
 
         plt.tight_layout()
@@ -315,7 +420,7 @@ if __name__ == "__main__":
     )
 
     results = detector.detect_ct(
-        "D:\BaiduNetdiskDownload\LUNA16\subset0\\1.3.6.1.4.1.14519.5.2.1.6279.6001.238522526736091851696274044574.mhd"
+        "D:\BaiduNetdiskDownload\LUNA16\subset0\\1.3.6.1.4.1.14519.5.2.1.6279.6001.905371958588660410240398317235.mhd"
     )
 
 
