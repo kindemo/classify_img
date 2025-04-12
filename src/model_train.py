@@ -33,6 +33,19 @@ class YoloTrainer:
 
     def train(self, train_dataset, val_dataset):
         self.model.compile(optimizer="adam",loss=self.loss_fn)
+
+        # # 编译时设置loss_weights字典
+        # self.model.compile(
+        #     optimizer="adam",
+        #     loss=self.loss_fn,
+        #     loss_weights={
+        #         'large': 0.1,
+        #         'medium': 0.3,
+        #         'small': 0.6
+        #     }
+        # )
+
+
         self.model.fit(train_dataset,
                        callbacks=[self.checkpoint_callback],
                        validation_data=val_dataset,  # 添加验证数据

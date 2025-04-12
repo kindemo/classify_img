@@ -40,9 +40,9 @@ def precompute_anchor_indices(config):
 
 def parse_label(label_path, config, anchor_indices):
     labels = {
-        'large': np.zeros((13, 13, 3, 6), dtype=np.float32),
-        'medium': np.zeros((26, 26, 3, 6), dtype=np.float32),
-        'small': np.zeros((52, 52, 3, 6), dtype=np.float32)
+        'large': np.zeros((config.grid_sizes[0], config.grid_sizes[0], 3, 6), dtype=np.float32),
+        'medium': np.zeros((config.grid_sizes[1], config.grid_sizes[1], 3, 6), dtype=np.float32),
+        'small': np.zeros((config.grid_sizes[2], config.grid_sizes[2], 3, 6), dtype=np.float32)
     }
 
     with open(label_path) as f:
@@ -123,9 +123,9 @@ def create_dataset(config, batch_size=16):
     output_signature = (
         tf.TensorSpec(shape=(config.input_size, config.input_size, 1), dtype=tf.float32),
         {
-            'large': tf.TensorSpec(shape=(13, 13, 3, 6), dtype=tf.float32),
-            'medium': tf.TensorSpec(shape=(26, 26, 3, 6), dtype=tf.float32),
-            'small': tf.TensorSpec(shape=(52, 52, 3, 6), dtype=tf.float32)
+            'large': tf.TensorSpec(shape=(config.grid_sizes[0], config.grid_sizes[0], 3, 6), dtype=tf.float32),
+            'medium': tf.TensorSpec(shape=(config.grid_sizes[1], config.grid_sizes[1], 3, 6), dtype=tf.float32),
+            'small': tf.TensorSpec(shape=(config.grid_sizes[2], config.grid_sizes[2], 3, 6), dtype=tf.float32)
         }
     )
 

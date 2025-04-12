@@ -402,7 +402,7 @@ model = tf.keras.models.load_model(
 
 # 使用示例（需要指定结节世界坐标）局部切片
 visualize_predictions(
-    mhd_path="D:\BaiduNetdiskDownload\LUNA16\subset0\\1.3.6.1.4.1.14519.5.2.1.6279.6001.278660284797073139172446973682.mhd",
+    mhd_path="D:\BaiduNetdiskDownload\LUNA16\subset0\\1.3.6.1.4.1.14519.5.2.1.6279.6001.979083010707182900091062408058.mhd",
     coord_world=(-96.40444755,43.84058194,-155.3710194),  # 示例坐标，需替换为真实结节坐标
     model=model,
     anchors=config.MODEL["anchors"],

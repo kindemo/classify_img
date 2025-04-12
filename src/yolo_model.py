@@ -56,7 +56,7 @@ class CSPDarknet53(Model):
 
     def call(self, inputs):
         x = self.conv1(inputs)
-        print("CSPDarknet53输入形状:", x.shape)
+        # print("CSPDarknet53输入形状:", x.shape)
         x = self.conv2(x)
         x = self.csp1(x)
         x = self.conv3(x)
@@ -119,10 +119,10 @@ class PANet(Model):
         y_medium = self.conv_down2(y)
 
         # 确保输出形状正确
-        print("PANet 输出形状：")
-        print(f"x_small: {x_small.shape}")
-        print(f"y_medium: {y_medium.shape}")
-        print(f"route_large: {route_large.shape}")
+        # print("PANet 输出形状：")
+        # print(f"x_small: {x_small.shape}")
+        # print(f"y_medium: {y_medium.shape}")
+        # print(f"route_large: {route_large.shape}")
 
         return x_small, y_medium, route_large
 
@@ -222,52 +222,112 @@ class YOLOv4(Model):
 
 class YoloLoss(tf.keras.losses.Loss):
     def __init__(self, anchors, num_classes, reduction="sum_over_batch_size",  # 新增父类参数处理
-                 name='yolo_loss'):
+                 name='yolo_loss', lambda_coord = 10.0, lambda_noobj=0.5):
         super().__init__(reduction=reduction, name=name)  # 关键：显式传递父类参数
         self.anchors = anchors
         self.num_classes = num_classes
 
+        self.lambda_coord = lambda_coord  # 坐标损失权重
+        self.lambda_noobj = lambda_noobj  # 负样本置信度损失权重
+
     def call(self, y_true, y_pred):
-        # 验证输入形状
-        print("y_true 形状:", y_true.shape)
-        print("y_pred 形状:", y_pred.shape)
+        # 验证输入形状 对于y_true最后一个维度有(x,y,w,h,conf,prob)    置信度表示是否存在目标,类别概率表示目标类别的预测该v了
+        # print("y_true 形状:", y_true.shape)
+        # print("y_pred 形状:", y_pred.shape)
+        # 输入验证
+        tf.debugging.assert_shapes([
+            (y_true, (None, None, None, None, 5 + self.num_classes)),
+            (y_pred, (None, None, None, None, 5 + self.num_classes))
+        ])
+
+        obj_mask = y_true[..., 4:5]  # (B,H,W,A,1)
+        noobj_mask = 1.0 - obj_mask
+
+        # 坐标损失（带数值稳定性）
+        pred_xy = tf.sigmoid(y_pred[..., 0:2])
+        pred_wh = tf.clip_by_value(tf.exp(y_pred[..., 2:4]), 1e-3, 1e3)
+        pred_box = tf.concat([pred_xy, pred_wh], axis=-1)
+
+        coord_diff = tf.square(y_true[..., :4] - pred_box)
+        coord_loss = tf.reduce_sum(obj_mask * coord_diff, [1, 2, 3, 4]) * self.lambda_coord
+
+        # 置信度损失（带梯度保护）
+        pred_conf = tf.clip_by_value(tf.sigmoid(y_pred[..., 4:5]), 1e-7, 1.0 - 1e-7)
+
+        # 正样本损失
+        bce_obj = tf.keras.losses.binary_crossentropy(obj_mask, pred_conf, axis=-1)
+        bce_obj = tf.expand_dims(bce_obj, -1)  # 保持5D形状
+        conf_loss_obj = bce_obj * obj_mask
+
+        # 负样本损失
+        bce_noobj = tf.keras.losses.binary_crossentropy(obj_mask, pred_conf, axis=-1)
+        bce_noobj = tf.expand_dims(bce_noobj, -1)
+        conf_loss_noobj = bce_noobj * noobj_mask * self.lambda_noobj
+
+        conf_loss = tf.reduce_sum(conf_loss_obj + conf_loss_noobj, [1, 2, 3, 4])
+
+        # 分类损失（带标签平滑）
+        # 分类损失修正
+        true_cls = y_true[..., 5:5 + self.num_classes]
+        pred_cls = tf.clip_by_value(
+            tf.sigmoid(y_pred[..., 5:5 + self.num_classes]),
+            1e-7, 1.0 - 1e-7
+        )
+
+        # 步骤1：计算交叉熵并保持维度
+        cls_bce = tf.keras.losses.binary_crossentropy(
+            true_cls, pred_cls, axis=-1
+        )  # 输出形状 (B,13,13,3)
+
+        # 步骤2：扩展维度以匹配mask
+        cls_bce = tf.expand_dims(cls_bce, axis=-1)  # 形状变为 (B,13,13,3,1)
+
+        # 步骤3：应用物体掩码
+        cls_loss = tf.reduce_sum(
+            obj_mask * cls_bce,
+            axis=[1, 2, 3, 4]  # 正确减少维度
+        )
+
+        return coord_loss + conf_loss + cls_loss
+
+
+    # def call(self, y_true, y_pred):
+
+
         # 确保输入维度正确
         # assert y_pred.shape[-1] == 5 + self.num_classes
         # assert y_true.shape[-1] == 5 + self.num_classes
 
-        # 提取物体掩码并调整维度
-        obj_mask = tf.expand_dims(y_true[..., 4], axis=-1)  # (batch, grid, grid, anchors, 1)
-        print("obj_mask 形状:", obj_mask.shape)
-        print("obj_mask 非零数量:", tf.reduce_sum(obj_mask))
-
-        # 坐标损失（仅对有物体的位置计算）
-        pred_box = y_pred[..., :4]
-        true_box = y_true[..., :4]
-        coord_loss = tf.reduce_sum(obj_mask * tf.square(true_box - pred_box), axis=[1, 2, 3, 4])
-        print("coord_loss 值:", coord_loss)
+        # 之前的方法
+        # pred_box = y_pred[..., :4]
+        # true_box = y_true[..., :4]
+        # coord_loss = tf.reduce_sum(obj_mask * tf.square(true_box - pred_box), axis=[1, 2, 3, 4])
+        # print("coord_loss 值:", coord_loss)
 
         # 置信度损失（Sigmoid处理）
-        pred_conf = tf.sigmoid(y_pred[..., 4:5])
-        true_conf = y_true[..., 4:5]
-        conf_loss = tf.keras.losses.binary_crossentropy(true_conf, pred_conf)
-        conf_loss = tf.reduce_sum(conf_loss * tf.squeeze(obj_mask, axis=-1), axis=[1, 2, 3])
+        # pred_conf = tf.sigmoid(y_pred[..., 4:5])
+        # true_conf = y_true[..., 4:5]
+        # conf_loss = tf.keras.losses.binary_crossentropy(true_conf, pred_conf)
+        # conf_loss = tf.reduce_sum(conf_loss * tf.squeeze(obj_mask, axis=-1), axis=[1, 2, 3])
 
-        # 分类损失（Sigmoid处理）
-        pred_cls = tf.sigmoid(y_pred[..., 5:5 + self.num_classes])
-        true_cls = y_true[..., 5:5 + self.num_classes]
-        cls_loss = tf.keras.losses.binary_crossentropy(true_cls, pred_cls)
-        cls_loss = tf.reduce_sum(cls_loss * tf.squeeze(obj_mask, axis=-1), axis=[1, 2, 3])
+        # # 分类损失（Sigmoid处理）
+        # pred_cls = tf.sigmoid(y_pred[..., 5:5 + self.num_classes])
+        # true_cls = y_true[..., 5:5 + self.num_classes]
+        # cls_loss = tf.keras.losses.binary_crossentropy(true_cls, pred_cls)
+        # cls_loss = tf.reduce_sum(cls_loss * tf.squeeze(obj_mask, axis=-1), axis=[1, 2, 3])
 
-        # 总损失（保持batch维度）
-        total_loss = coord_loss + conf_loss + cls_loss
-        return total_loss
+        # # 总损失（保持batch维度）
+        # total_loss = coord_loss + conf_loss + cls_loss
+        # return total_loss
 
     def get_config(self):
         # 包含父类参数
         config = super().get_config()  # 获取父类配置
         config.update({
             "anchors": self.anchors,
-            "num_classes": self.num_classes
+            "num_classes": self.num_classes,
+            # "lambda_coord": self.lambda_coord,
+            # "lambda_noobj": self.lambda_noobj
         })
         return config
 

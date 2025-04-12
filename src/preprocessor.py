@@ -125,7 +125,7 @@ class LunaYoloPreprocessor():
         """处理单个结节"""
         world_coord = np.array([annot['coordX'], annot['coordY'], annot['coordZ']])
         voxel_coord = self._world_to_voxel(world_coord, ct_scan['origin'], ct_scan['spacing'])
-        print(f"转换后体素坐标: {voxel_coord}, CT数据形状: {ct_scan['data'].shape}")
+        print(f"转换后体素坐标(z,y,x): {voxel_coord}, CT数据形状: {ct_scan['data'].shape}")
 
         if not self._is_valid_coordinate(voxel_coord, ct_scan['data'].shape):
             print(f"无效坐标跳过: {voxel_coord}")
@@ -163,7 +163,7 @@ class FullSlicePreprocessor:
         """处理单个患者的全部CT切片"""
         # 读取CT数据
         ct_scan = sitk.ReadImage(mhd_path)
-        ct_array = sitk.GetArrayFromImage(ct_scan)  # shape: (num_slices, height, width)
+        ct_array = sitk.GetArrayFromImage(ct_scan)  # shape: (num_slices, height, width),(z,y,x)
 
         origin = ct_scan.GetOrigin()
         spacing = ct_scan.GetSpacing()
@@ -267,7 +267,7 @@ class FocusSlicePreprocessor(FullSlicePreprocessor):
     def process_patient(self, mhd_path, annotations):
         """优化版：仅处理结节所在层及相邻切片"""
         ct_scan = sitk.ReadImage(mhd_path)
-        ct_array = sitk.GetArrayFromImage(ct_scan)  # shape: (slices, height, width)
+        ct_array = sitk.GetArrayFromImage(ct_scan)  # shape: (slices, height, width),(z,y,x)
         origin = ct_scan.GetOrigin()
         spacing = ct_scan.GetSpacing()
         # print(f"origin: {origin}, spacing: {spacing}")

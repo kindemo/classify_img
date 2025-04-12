@@ -176,9 +176,10 @@ class CTNoduleDetector:
 
         return final_results
 
-    def _detect_slice(self, slice_data, z_index, spacing, origin, window_size=416, stride=208):
+    def _detect_slice(self, slice_data, z_index, spacing, origin, window_size=config.input_size):
         """处理单个轴向切片"""
         detections = []
+        stride = window_size // 2
         h, w = slice_data.shape
 
         # 滑动窗口处理
@@ -224,7 +225,7 @@ class CTNoduleDetector:
         boxes = []
         z_index, y_start, x_start = offset  # 当前窗口的起始坐标（体素单位）
         num_classes = len(self.config['class_names'])
-        input_size = self.config['input_size']  # 模型输入尺寸，如416
+        input_size = self.config['input_size']  # 模型输入尺寸，如512
         window_size = 256  # 滑动窗口的原始尺寸
 
         # 计算每个网格单元的实际像素大小
@@ -251,7 +252,8 @@ class CTNoduleDetector:
                     for a in range(3):
                         # 解析置信度
                         conf = sigmoid(pred[i, j, a, 4])
-                        if conf < 0.50:  # 过滤低置信度
+                        print(f'conf: {conf}')
+                        if conf < 0.01:  # 过滤低置信度
                             continue
 
                         # 关键修改点1：正确计算中心坐标
@@ -401,7 +403,7 @@ class CTNoduleDetector:
 # -------------------- 使用示例 --------------------
 if __name__ == "__main__":
     configs = {
-        'input_size': 416,
+        'input_size': config.input_size,
         'anchors': config.MODEL["anchors"],  # 与训练配置一致
         'class_names': ['nodule']
     }
@@ -420,7 +422,7 @@ if __name__ == "__main__":
     )
 
     results = detector.detect_ct(
-        "D:\BaiduNetdiskDownload\LUNA16\subset0\\1.3.6.1.4.1.14519.5.2.1.6279.6001.905371958588660410240398317235.mhd"
+        "D:\BaiduNetdiskDownload\LUNA16\subset0\\1.3.6.1.4.1.14519.5.2.1.6279.6001.566816709786169715745131047975.mhd"
     )
 
 
