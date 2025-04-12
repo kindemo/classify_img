@@ -21,10 +21,10 @@ class Config:
         if not os.path.exists(self.annotation_csv):
             raise FileNotFoundError(f"标注文件不存在: {self.annotation_csv}")
 
-        self.epoch = 3
+        self.epoch = 8
         self.input_size = 512       # 单维度
         self.num_classes = 1
-        self.batch_size = 5
+        self.batch_size = 8
 
         # self.anchors = [
         #     [(142, 110), (192, 243), (459, 401)],  # 大尺度

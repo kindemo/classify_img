@@ -25,10 +25,11 @@ def sliding_window_3d(volume, window_size=256, stride=128):
 
 def voxel_to_world(voxel_coord, origin, spacing):
     """体素坐标转世界坐标 (x,y,z顺序适配CT标准)"""
+    x, y, z = voxel_coord  # 正确顺序为(x,y,z)
     return [
-        origin[0] + voxel_coord[0] * spacing[0],
-        origin[1] + voxel_coord[1] * spacing[1],
-        origin[2] + voxel_coord[2] * spacing[2]
+        origin[0] + x * spacing[0],
+        origin[1] + y * spacing[1],
+        origin[2] + z * spacing[2]
     ]
 
 
@@ -169,7 +170,6 @@ class CTNoduleDetector:
             box['height'] = max_size
 
         # 6. 可视化（传递真实标注和坐标信息）
-        # self._visualize(ct_array, final_results, true_annotations, origin, spacing, target_z=91)
         for i in range(len(target_zs)):
             self._visualize(ct_array, final_results, true_annotations, origin, spacing,
                             target_z=target_zs[i])
@@ -253,7 +253,7 @@ class CTNoduleDetector:
                         # 解析置信度
                         conf = sigmoid(pred[i, j, a, 4])
                         print(f'conf: {conf}')
-                        if conf < 0.01:  # 过滤低置信度
+                        if conf < 0.2:  # 过滤低置信度
                             continue
 
                         # 关键修改点1：正确计算中心坐标
@@ -277,7 +277,7 @@ class CTNoduleDetector:
 
                         # 转换为世界坐标（毫米）
                         world_coord = voxel_to_world(
-                            (z_index, y_center, x_center),
+                            (x_center, y_center, z_index),
                             origin=origin,
                             spacing=spacing
                         )
@@ -298,7 +298,7 @@ class CTNoduleDetector:
                         })
         return boxes
 
-    def _nms(self, detections, iou_threshold=0.8):
+    def _nms(self, detections, iou_threshold=0.5):
         """二维非极大值抑制"""
         # 按z轴分组处理
         z_groups = {}
@@ -422,7 +422,7 @@ if __name__ == "__main__":
     )
 
     results = detector.detect_ct(
-        "D:\BaiduNetdiskDownload\LUNA16\subset0\\1.3.6.1.4.1.14519.5.2.1.6279.6001.566816709786169715745131047975.mhd"
+        "D:\BaiduNetdiskDownload\LUNA16\subset0\\1.3.6.1.4.1.14519.5.2.1.6279.6001.108197895896446896160048741492.mhd"
     )
 
 

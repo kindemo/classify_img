@@ -4,39 +4,66 @@ import cv2
 import numpy as np
 import tensorflow as tf
 
+# def precompute_anchor_indices(config):
+#     """预处理阶段计算所有可能的bbox尺寸对应的最佳锚框"""
+#     # 生成所有可能的归一化宽高组合
+#     width_bins = np.linspace(0, 1, 100)
+#     height_bins = np.linspace(0, 1, 100)
+#
+#     anchor_indices = {}
+#     for w in width_bins:
+#         for h in height_bins:
+#             # 计算实际像素尺寸
+#             pixel_w = w * config.input_size
+#             pixel_h = h * config.input_size
+#
+#             # 遍历所有锚框层级
+#             best_scale = None
+#             best_anchor = None
+#             max_iou = -1
+#             for scale_idx, scale_anchors in enumerate(config.anchors):
+#                 for anchor_idx, (aw, ah) in enumerate(scale_anchors):
+#                     # 计算IoU
+#                     intersection = min(pixel_w, aw) * min(pixel_h, ah)
+#                     union = (pixel_w * pixel_h) + (aw * ah) - intersection
+#                     iou = intersection / union
+#
+#                     if iou > max_iou:
+#                         max_iou = iou
+#                         best_scale = scale_idx
+#                         best_anchor = anchor_idx
+#
+#             anchor_indices[(w, h)] = (best_scale, best_anchor)
+#
+#     return anchor_indices
+
+
 def precompute_anchor_indices(config):
-    """预处理阶段计算所有可能的bbox尺寸对应的最佳锚框"""
-    # 生成所有可能的归一化宽高组合
+    anchor_indices = {}
     width_bins = np.linspace(0, 1, 100)
     height_bins = np.linspace(0, 1, 100)
 
-    anchor_indices = {}
     for w in width_bins:
         for h in height_bins:
-            # 计算实际像素尺寸
             pixel_w = w * config.input_size
             pixel_h = h * config.input_size
+            best_scale, best_anchor, max_iou = 0, 0, -1
 
-            # 遍历所有锚框层级
-            best_scale = None
-            best_anchor = None
-            max_iou = -1
-            for scale_idx, scale_anchors in enumerate(config.anchors):
-                for anchor_idx, (aw, ah) in enumerate(scale_anchors):
-                    # 计算IoU
-                    intersection = min(pixel_w, aw) * min(pixel_h, ah)
+            for scale_idx in range(3):
+                # 直接使用锚框的像素尺寸
+                scaled_anchors = config.anchors[scale_idx]
+                for anchor_idx, (aw, ah) in enumerate(scaled_anchors):
+                    inter_w = min(pixel_w, aw)
+                    inter_h = min(pixel_h, ah)
+                    intersection = inter_w * inter_h
                     union = (pixel_w * pixel_h) + (aw * ah) - intersection
-                    iou = intersection / union
+                    iou = intersection / (union + 1e-10)
 
                     if iou > max_iou:
-                        max_iou = iou
-                        best_scale = scale_idx
-                        best_anchor = anchor_idx
+                        max_iou, best_scale, best_anchor = iou, scale_idx, anchor_idx
 
             anchor_indices[(w, h)] = (best_scale, best_anchor)
-
     return anchor_indices
-
 
 def parse_label(label_path, config, anchor_indices):
     labels = {
@@ -65,12 +92,12 @@ def parse_label(label_path, config, anchor_indices):
 
             # 填充对应层级的标签张量
             scale_key = ['large', 'medium', 'small'][scale_idx]
-            labels[scale_key][grid_y, grid_x, anchor_idx] = [
+            labels[scale_key][grid_x, grid_y, anchor_idx] = [
                 dx, dy,
                 np.log(width / config.anchors[scale_idx][anchor_idx][0]),
                 np.log(height / config.anchors[scale_idx][anchor_idx][1]),
                 1.0,  # 置信度
-                class_id
+                1.0
             ]
 
     return labels

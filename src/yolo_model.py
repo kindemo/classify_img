@@ -222,7 +222,7 @@ class YOLOv4(Model):
 
 class YoloLoss(tf.keras.losses.Loss):
     def __init__(self, anchors, num_classes, reduction="sum_over_batch_size",  # 新增父类参数处理
-                 name='yolo_loss', lambda_coord = 10.0, lambda_noobj=0.5):
+                 name='yolo_loss', lambda_coord = 30.0, lambda_noobj=0.5):
         super().__init__(reduction=reduction, name=name)  # 关键：显式传递父类参数
         self.anchors = anchors
         self.num_classes = num_classes
@@ -330,6 +330,8 @@ class YoloLoss(tf.keras.losses.Loss):
             # "lambda_noobj": self.lambda_noobj
         })
         return config
+
+
 
 
 # YOLOv4模型集成(列表方式返回）

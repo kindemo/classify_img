@@ -16,9 +16,17 @@ class YoloTrainer:
         )
 
         self.loss_fn  = {
-            'large': YoloLoss(config.anchors[0], config.num_classes, reduction="sum_over_batch_size"),  # large层损失
-            'medium': YoloLoss(config.anchors[1], config.num_classes, reduction="sum_over_batch_size"),  # medium层损失
-            'small': YoloLoss(config.anchors[2], config.num_classes, reduction="sum_over_batch_size")  # small层损失
+            'large': YoloLoss(config.anchors[0],
+                              config.num_classes,
+                              reduction="sum_over_batch_size"),  # large层损失
+
+            'medium': YoloLoss(config.anchors[1],
+                               config.num_classes,
+                               reduction="sum_over_batch_size"),  # medium层损失
+
+            'small': YoloLoss(config.anchors[2],
+                              config.num_classes,
+                              reduction="sum_over_batch_size")  # small层损失
         }
 
         # 创建回调函数以保存模型
